@@ -35,6 +35,7 @@ class OpenRouterClient:
         model: str,
         messages: list[dict[str, str]],
         temperature: float,
+        reasoning_effort: str | None = None,
         retries: int = 3,
     ) -> LLMResponse:
         if not self.api_key:
@@ -50,6 +51,8 @@ class OpenRouterClient:
             "messages": messages,
             "temperature": temperature,
         }
+        if reasoning_effort:
+            payload["reasoning"] = {"effort": reasoning_effort}
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             for attempt in range(retries):

@@ -41,6 +41,8 @@ class Task(SQLModel, table=True):
     description_hash: str
     transcript_root: str
     default_judge_prompt_path: str
+    default_pairing_sample_pct: float = 100.0
+    default_swap_enabled: bool = True
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -55,10 +57,29 @@ class Run(SQLModel, table=True):
     k_factor: float = 32.0
     max_concurrency: int = 5
     sample_size: Optional[int] = None
+    pairing_sample_pct: float = 100.0
     error: Optional[str] = None
     created_at: datetime = Field(default_factory=utc_now)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+
+
+class RunLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="run.id")
+    level: str = "info"
+    message: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class RunAnalysis(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: int = Field(foreign_key="run.id")
+    model_id: str
+    sample_size: int
+    summary: str
+    prompt_snapshot: str
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class GeneratorConfig(SQLModel, table=True):
@@ -104,6 +125,7 @@ class Generation(SQLModel, table=True):
     completion_tokens: Optional[int] = None
     cost: Optional[float] = None
     created_at: datetime = Field(default_factory=utc_now)
+    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
 
@@ -127,6 +149,11 @@ class Judgement(SQLModel, table=True):
     reasoning: str
     raw_response: str
     error: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    cost: Optional[float] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -147,4 +174,3 @@ class EloRating(SQLModel, table=True):
     wins: int = 0
     losses: int = 0
     ties: int = 0
-
