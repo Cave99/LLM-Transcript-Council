@@ -9,6 +9,8 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class FileSnapshot:
+    """Immutable content snapshot captured from disk at run creation."""
+
     path: str
     content: str
     content_hash: str
@@ -35,4 +37,3 @@ def list_markdown_files(root: str | Path) -> list[Path]:
     if resolved.is_file():
         return [resolved] if resolved.suffix.lower() == ".md" else []
     return sorted(path for path in resolved.rglob("*.md") if path.is_file())
-

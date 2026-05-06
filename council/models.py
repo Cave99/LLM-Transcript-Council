@@ -15,6 +15,8 @@ from sqlmodel import Field, SQLModel
 
 
 def utc_now() -> datetime:
+    """Return a timezone-aware UTC timestamp for database defaults."""
+
     return datetime.now(timezone.utc)
 
 

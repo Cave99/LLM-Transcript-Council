@@ -6,6 +6,8 @@ from app import judge_pattern_analysis_availability
 
 
 def test_reset_run_clears_previous_results(tmp_path):
+    """Resetting a run should clear outputs, votes, and leaderboard state."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'runner.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -120,6 +122,8 @@ def test_reset_run_clears_previous_results(tmp_path):
 
 
 def test_recover_run_only_requeues_missing_outputs_and_stop_pauses(tmp_path):
+    """Recover should preserve partial work, while stop should pause the run."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'recover.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -186,6 +190,8 @@ def test_recover_run_only_requeues_missing_outputs_and_stop_pauses(tmp_path):
 
 
 def test_apply_match_elo_updates_leaderboard_immediately(tmp_path):
+    """One completed match should update the live ELO rows right away."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'elo.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -236,6 +242,8 @@ def test_apply_match_elo_updates_leaderboard_immediately(tmp_path):
 
 
 def test_pairing_sample_percent_reduces_match_rows(tmp_path):
+    """Pairing sample percentage should trim the number of match rows."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'pairings.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -280,6 +288,8 @@ def test_pairing_sample_percent_reduces_match_rows(tmp_path):
 
 
 def test_rename_project_updates_name(tmp_path):
+    """Renaming should persist a trimmed project name."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'rename-project.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -294,6 +304,8 @@ def test_rename_project_updates_name(tmp_path):
 
 
 def test_create_task_stores_run_defaults(tmp_path):
+    """Task creation should store the default pairing and swap settings."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'task-defaults.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -322,6 +334,8 @@ def test_create_task_stores_run_defaults(tmp_path):
 
 
 def test_delete_task_removes_related_runs_and_snapshots(tmp_path):
+    """Deleting a task should cascade through its runs and snapshots."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'delete-task.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -373,6 +387,8 @@ def test_delete_task_removes_related_runs_and_snapshots(tmp_path):
 
 
 def test_delete_project_removes_its_tasks(tmp_path):
+    """Deleting a project should remove all of its descendant records."""
+
     engine = create_engine(f"sqlite:///{tmp_path / 'delete-project.db'}", connect_args={"check_same_thread": False})
     SQLModel.metadata.create_all(engine)
 
@@ -417,6 +433,8 @@ def test_delete_project_removes_its_tasks(tmp_path):
 
 
 def test_judge_pattern_analysis_available_for_paused_runs_with_enough_votes():
+    """Paused runs need enough judge votes before pattern analysis is allowed."""
+
     run = Run(task_id=1, name="demo", status=Status.paused)
 
     allowed, _message = judge_pattern_analysis_availability(run, 10)

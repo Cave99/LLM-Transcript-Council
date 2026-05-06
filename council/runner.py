@@ -41,6 +41,8 @@ from council.openrouter import OpenRouterClient
 
 @dataclass(frozen=True)
 class GeneratorSpec:
+    """Lightweight generator configuration used while creating a run."""
+
     label: str
     model_id: str
     temperature: float
@@ -49,6 +51,8 @@ class GeneratorSpec:
 
 @dataclass(frozen=True)
 class JudgeSpec:
+    """Lightweight judge configuration used while creating a run."""
+
     label: str
     model_id: str
     temperature: float
@@ -56,6 +60,8 @@ class JudgeSpec:
 
 
 def create_project(session: Session, name: str) -> Project:
+    """Create a project with a trimmed display name."""
+
     project = Project(name=name.strip())
     session.add(project)
     session.commit()
@@ -64,6 +70,8 @@ def create_project(session: Session, name: str) -> Project:
 
 
 def rename_project(session: Session, project_id: int, name: str) -> Project | None:
+    """Rename a project if it exists and the new name is non-empty."""
+
     project = session.get(Project, project_id)
     if not project:
         return None
@@ -78,6 +86,8 @@ def rename_project(session: Session, project_id: int, name: str) -> Project | No
 
 
 def delete_run(session: Session, run_id: int) -> None:
+    """Delete a run and every row that depends on it."""
+
     session.exec(delete(Judgement).where(Judgement.match_id.in_(select(Match.id).where(Match.run_id == run_id))))
     session.exec(delete(MatchResult).where(MatchResult.match_id.in_(select(Match.id).where(Match.run_id == run_id))))
     session.exec(delete(Match).where(Match.run_id == run_id))
@@ -92,6 +102,8 @@ def delete_run(session: Session, run_id: int) -> None:
 
 
 def delete_task(session: Session, task_id: int) -> None:
+    """Delete a task and all of its runs before removing the task row."""
+
     run_ids = list(session.exec(select(Run.id).where(Run.task_id == task_id)).all())
     for run_id in run_ids:
         delete_run(session, run_id)
@@ -99,6 +111,8 @@ def delete_task(session: Session, task_id: int) -> None:
 
 
 def delete_project(session: Session, project_id: int) -> None:
+    """Delete a project after recursively deleting its tasks."""
+
     task_ids = list(session.exec(select(Task.id).where(Task.project_id == project_id)).all())
     for task_id in task_ids:
         delete_task(session, task_id)
@@ -116,6 +130,8 @@ def create_task(
     default_pairing_sample_pct: float = 100.0,
     default_swap_enabled: bool = True,
 ) -> Task:
+    """Create a task and snapshot its markdown inputs for later auditing."""
+
     description = read_text_snapshot(description_path)
     task = Task(
         project_id=project_id,
@@ -147,6 +163,8 @@ def create_run(
     max_concurrency: int = 5,
     swap_enabled: bool = True,
 ) -> Run:
+    """Create a run, snapshot all inputs, and prebuild generation and match rows."""
+
     task = session.get(Task, task_id)
     if not task:
         raise ValueError(f"Task {task_id} does not exist")
@@ -220,6 +238,8 @@ def create_run(
 
 
 def reset_run(session: Session, run_id: int) -> Run:
+    """Reset a run so it can be rerun from scratch with fresh outputs."""
+
     run = session.get(Run, run_id)
     if not run:
         raise ValueError(f"Run {run_id} does not exist")
@@ -266,6 +286,8 @@ def reset_run(session: Session, run_id: int) -> Run:
 
 
 def recover_run(session: Session, run_id: int) -> Run:
+    """Requeue only incomplete work that never captured an output."""
+
     run = session.get(Run, run_id)
     if not run:
         raise ValueError(f"Run {run_id} does not exist")
@@ -300,6 +322,8 @@ def recover_run(session: Session, run_id: int) -> Run:
 
 
 def stop_run(session: Session, run_id: int) -> Run:
+    """Mark a run as paused so background workers stop scheduling new work."""
+
     run = session.get(Run, run_id)
     if not run:
         raise ValueError(f"Run {run_id} does not exist")
@@ -312,17 +336,25 @@ def stop_run(session: Session, run_id: int) -> Run:
 
 
 def add_run_log(session: Session, run_id: int, message: str, *, level: str = "info") -> None:
+    """Store a run log row and mirror it to stdout for easy debugging."""
+
     session.add(RunLog(run_id=run_id, level=level, message=message))
     print(f"[run {run_id}] {level.upper()}: {message}", flush=True)
 
 
 def is_run_paused(session: Session, run_id: int) -> bool:
+    """Return whether the run is currently paused."""
+
     run = session.get(Run, run_id)
     return bool(run and run.status == Status.paused)
 
 
 def run_progress(session: Session, run_id: int) -> dict[str, int]:
+    """Return a compact progress summary for the run detail page."""
+
     def count(model, status: Status | None = None) -> int:
+        """Count rows for one run, optionally filtered by status."""
+
         statement = select(model).where(model.run_id == run_id)
         if status:
             statement = statement.where(model.status == status)
@@ -357,7 +389,7 @@ def run_progress(session: Session, run_id: int) -> dict[str, int]:
 
 
 async def execute_run(run_id: int, session_factory, client: OpenRouterClient | None = None) -> None:
-    """Execute or resume a run."""
+    """Execute the full generation, judging, and leaderboard pipeline."""
 
     client = client or OpenRouterClient()
     if not client.api_key:
@@ -406,6 +438,8 @@ async def execute_run(run_id: int, session_factory, client: OpenRouterClient | N
 
 
 def _ensure_generation_rows(session: Session, run_id: int) -> None:
+    """Create any missing generation rows for transcript/config combinations."""
+
     transcripts = session.exec(select(Transcript).where(Transcript.run_id == run_id)).all()
     configs = session.exec(select(GeneratorConfig).where(GeneratorConfig.run_id == run_id)).all()
     existing = {
@@ -425,6 +459,8 @@ def _ensure_generation_rows(session: Session, run_id: int) -> None:
 
 
 def _ensure_match_rows(session: Session, run_id: int) -> None:
+    """Create any missing match rows for the current run configuration."""
+
     run = session.get(Run, run_id)
     transcripts = session.exec(select(Transcript).where(Transcript.run_id == run_id)).all()
     configs = session.exec(select(GeneratorConfig).where(GeneratorConfig.run_id == run_id)).all()
@@ -463,6 +499,8 @@ def _ensure_match_rows(session: Session, run_id: int) -> None:
 
 
 def _ensure_elo_rows(session: Session, run_id: int) -> None:
+    """Create missing leaderboard rows for each generator config."""
+
     run = session.get(Run, run_id)
     configs = session.exec(select(GeneratorConfig).where(GeneratorConfig.run_id == run_id)).all()
     existing = {
@@ -482,6 +520,8 @@ def _ensure_elo_rows(session: Session, run_id: int) -> None:
 
 
 async def _run_generations(run_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
+    """Queue and execute every incomplete generation in parallel."""
+
     with session_factory() as session:
         generation_ids = [
             row.id
@@ -499,6 +539,8 @@ async def _run_generations(run_id: int, session_factory, client: OpenRouterClien
 
 
 async def _run_matches(run_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
+    """Queue and execute match judging one pair at a time."""
+
     with session_factory() as session:
         match_ids = [
             row.id
@@ -519,6 +561,8 @@ async def _run_matches(run_id: int, session_factory, client: OpenRouterClient, s
 
 
 async def _generate_one(generation_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
+    """Run one generator call and persist either the output or failure."""
+
     async with semaphore:
         with session_factory() as session:
             generation = session.get(Generation, generation_id)
@@ -583,6 +627,8 @@ async def _generate_one(generation_id: int, session_factory, client: OpenRouterC
 
 
 async def _judge_match(match_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
+    """Run all judges for one match and store the final match result."""
+
     with session_factory() as session:
         match = session.get(Match, match_id)
         if not match or match.status == Status.complete:
@@ -660,6 +706,8 @@ async def _judge_with_swap(
     client: OpenRouterClient,
     semaphore: asyncio.Semaphore,
 ) -> str:
+    """Run a judge twice, then reconcile the swapped vote back to one result."""
+
     first = await _judge_once(
         match_id,
         judge_id,
@@ -699,6 +747,8 @@ async def _judge_once(
     client: OpenRouterClient,
     semaphore: asyncio.Semaphore,
 ) -> str:
+    """Run one judge prompt and persist the raw vote and reasoning."""
+
     with session_factory() as session:
         existing = session.exec(
             select(Judgement).where(
@@ -772,6 +822,8 @@ async def _judge_once(
 
 
 def _recalculate_elo(session: Session, run_id: int) -> None:
+    """Rebuild the leaderboard from completed match results."""
+
     run = session.get(Run, run_id)
     ratings = {
         row.generator_config_id: row
@@ -810,6 +862,8 @@ def _recalculate_elo(session: Session, run_id: int) -> None:
 
 
 def _apply_match_elo(session: Session, match: Match, final_winner: str) -> None:
+    """Apply one completed match result to the live leaderboard rows."""
+
     run = session.get(Run, match.run_id)
     rating_a = session.exec(
         select(EloRating).where(

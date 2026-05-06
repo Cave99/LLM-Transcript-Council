@@ -32,7 +32,7 @@ def parse_json_object(text: str) -> dict[str, Any]:
 
 
 def maybe_repair_json(text: str) -> str:
-    """Repair JSON-like output when json_repair is installed; otherwise no-op."""
+    """Repair JSON-like output when ``json_repair`` is available."""
 
     try:
         from json_repair import repair_json
@@ -42,4 +42,3 @@ def maybe_repair_json(text: str) -> str:
         return repair_json(text)
     except Exception:
         return text
-

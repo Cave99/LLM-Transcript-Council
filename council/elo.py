@@ -20,7 +20,7 @@ def update_elo(
     *,
     k_factor: float = 32.0,
 ) -> tuple[float, float]:
-    """Return updated ELO ratings for A and B."""
+    """Return updated ELO ratings for the two compared configs."""
 
     expected_a = 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
     expected_b = 1 - expected_a
@@ -52,7 +52,7 @@ def majority_vote(votes: list[Winner]) -> Winner:
 
 
 def remap_swapped_vote(swapped_winner: Winner) -> Winner:
-    """Map a vote from the swapped B/A prompt back to the original A/B positions."""
+    """Map a swapped vote back to the original A/B positions."""
 
     if swapped_winner == "A":
         return "B"
@@ -70,4 +70,3 @@ def consistent_swapped_vote(first: Winner, swapped: Winner) -> Winner:
 
     remapped = remap_swapped_vote(swapped)
     return first if first == remapped else "TIE"
-

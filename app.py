@@ -70,10 +70,14 @@ RUN_THREADS: dict[int, threading.Thread] = {}
 
 
 def session() -> Session:
+    """Return a short-lived database session for request handlers."""
+
     return Session(engine)
 
 
 def shell(title: str, *content):
+    """Wrap a page body in the shared app chrome."""
+
     return Html(
         Head(
             Title(f"{title} - LLM-Transcript-Council"),
@@ -97,6 +101,8 @@ def shell(title: str, *content):
 
 
 def help_label(label: str, help_text: str | None = None):
+    """Render a form label with an optional inline help tooltip."""
+
     return Span(
         Span(label),
         Span("?", title=help_text, cls="help-dot") if help_text else "",
@@ -105,18 +111,26 @@ def help_label(label: str, help_text: str | None = None):
 
 
 def input_row(label: str, name: str, value: str = "", *, placeholder: str = "", type: str = "text", help_text: str | None = None, **attrs):
+    """Render a standard labeled input row used throughout the app."""
+
     return Label(help_label(label, help_text), Input(name=name, value=value, placeholder=placeholder, type=type, **attrs), cls="field")
 
 
 def textarea_row(label: str, name: str, value: str = "", *, rows: int = 4):
+    """Render a labeled textarea row."""
+
     return Label(Span(label), Textarea(value, name=name, rows=rows), cls="field")
 
 
 def selected_option(value, label, selected=False):
+    """Render a select option with stringified values."""
+
     return Option(label, value=str(value), selected=selected)
 
 
 def path_label(path: str | Path) -> str:
+    """Show paths relative to the current repo when possible."""
+
     resolved = Path(path)
     cwd = Path.cwd().resolve()
     try:
@@ -126,6 +140,8 @@ def path_label(path: str | Path) -> str:
 
 
 def preview_text(text: str, limit: int = 220) -> str:
+    """Collapse long text into a short preview for summary cards."""
+
     compact = " ".join(text.split())
     if len(compact) <= limit:
         return compact
@@ -136,6 +152,8 @@ def preview_text(text: str, limit: int = 220) -> str:
 
 
 def prompt_picker(label: str, name: str, files: list[Path], selected: str | Path | None = None, help_text: str | None = None):
+    """Render a file input paired with a dropdown of prompt files."""
+
     selected_path = str(Path(selected).resolve()) if selected else None
     fallback = selected_path or (str(files[0].resolve()) if files else "")
     return Label(
@@ -155,10 +173,14 @@ def prompt_picker(label: str, name: str, files: list[Path], selected: str | Path
 
 
 def model_input(name: str, value: str):
+    """Render a model ID text field with a helpful placeholder."""
+
     return Input(name=name, value=value, placeholder="openai/gpt-4o-mini")
 
 
 def config_card(kind: str, index: int, *, prompt_files: list[Path], defaults: dict[str, str], required: bool = False):
+    """Render one generator or judge configuration card."""
+
     prefix = f"{kind}_{index}"
     title = f"{kind.title()} {index}"
     return Div(
@@ -173,10 +195,14 @@ def config_card(kind: str, index: int, *, prompt_files: list[Path], defaults: di
 
 
 def status_pill(status: str):
+    """Render a small status badge for runs and work items."""
+
     return Span(status, cls=f"pill pill-{status}")
 
 
 def empty_state(title: str, body: str, href: str | None = None, action: str | None = None):
+    """Render a plain empty-state panel with an optional call to action."""
+
     children = [H3(title), P(body, cls="muted")]
     if href and action:
         children.append(A(action, href=href, cls="button subtle"))
@@ -184,6 +210,8 @@ def empty_state(title: str, body: str, href: str | None = None, action: str | No
 
 
 def delete_form(action: str, confirm_message: str):
+    """Render a destructive form that asks for confirmation in the UI."""
+
     return Form(
         Button("Delete", type="submit", cls="button subtle danger"),
         action=action,
@@ -194,6 +222,8 @@ def delete_form(action: str, confirm_message: str):
 
 
 def list_card(title: str, href: str, meta: str, delete_action: str, confirm_message: str):
+    """Render a clickable summary card with a paired delete action."""
+
     return Div(
         A(H3(title), P(meta), href=href, cls="card-link"),
         delete_form(delete_action, confirm_message),
@@ -203,6 +233,8 @@ def list_card(title: str, href: str, meta: str, delete_action: str, confirm_mess
 
 @rt("/")
 def get():
+    """Render the project index page."""
+
     with session() as db:
         projects = db.exec(select(Project).order_by(Project.created_at.desc())).all()
         runs = db.exec(select(Run).order_by(Run.created_at.desc()).limit(5)).all()
@@ -251,11 +283,15 @@ def get():
 
 @rt("/projects")
 def get():
+    """Redirect the legacy projects index to the home page."""
+
     return RedirectResponse("/", status_code=303)
 
 
 @rt("/projects")
 def post(name: str):
+    """Create a project from the home-page form."""
+
     if not name.strip():
         return RedirectResponse("/", status_code=303)
     with session() as db:
@@ -265,6 +301,8 @@ def post(name: str):
 
 @rt("/projects/{project_id}/delete")
 def post(project_id: int):
+    """Delete a project and redirect back to the home page."""
+
     with session() as db:
         project = db.get(Project, project_id)
         if not project:
@@ -276,6 +314,8 @@ def post(project_id: int):
 
 @rt("/projects/{project_id}/rename")
 def post(project_id: int, name: str):
+    """Rename a project from the inline edit form."""
+
     with session() as db:
         project = rename_project(db, project_id, name)
         if not project:
@@ -285,6 +325,8 @@ def post(project_id: int, name: str):
 
 @rt("/projects/{project_id}")
 def get(project_id: int):
+    """Render one project and its task list."""
+
     with session() as db:
         project = db.get(Project, project_id)
         tasks = db.exec(select(Task).where(Task.project_id == project_id)).all()
@@ -335,6 +377,8 @@ def get(project_id: int):
 
 @rt("/tasks/new")
 def get(project_id: int | None = None):
+    """Render the task creation page."""
+
     with session() as db:
         projects = db.exec(select(Project)).all()
     if not projects:
@@ -386,6 +430,8 @@ def post(
     default_pairing_sample_pct: str = "100",
     default_swap_enabled: str | None = None,
 ):
+    """Create a task from the task form."""
+
     if not name.strip():
         return RedirectResponse(f"/tasks/new?project_id={project_id}", status_code=303)
     with session() as db:
@@ -404,6 +450,8 @@ def post(
 
 @rt("/tasks/{task_id}/delete")
 def post(task_id: int):
+    """Delete a task and return to its parent project."""
+
     with session() as db:
         task = db.get(Task, task_id)
         if not task:
@@ -416,6 +464,8 @@ def post(task_id: int):
 
 @rt("/tasks/{task_id}")
 def get(task_id: int):
+    """Render a task detail page with its runs and transcript summary."""
+
     with session() as db:
         task = db.get(Task, task_id)
         runs = db.exec(select(Run).where(Run.task_id == task_id).order_by(Run.created_at.desc())).all()
@@ -440,6 +490,8 @@ def get(task_id: int):
 
 @rt("/runs/new")
 def get(task_id: int | None = None):
+    """Render the run creation page."""
+
     with session() as db:
         tasks = db.exec(select(Task)).all()
     if not tasks:
@@ -544,6 +596,8 @@ def post(
     judge_5_temperature: str = "0.0",
     judge_5_prompt_path: str = "",
 ):
+    """Create a run and immediately start execution in the background."""
+
     generators = build_generator_specs(
         [
             (generator_1_label, generator_1_model_id, generator_1_temperature, generator_1_prompt_path),
@@ -581,6 +635,8 @@ def post(
 
 @rt("/runs")
 def get():
+    """Render the global runs index."""
+
     with session() as db:
         runs = db.exec(select(Run).order_by(Run.created_at.desc())).all()
     return shell("Runs", Div(H1("Runs"), A("New run", href="/runs/new", cls="button"), cls="page-head"), run_table(runs))
@@ -588,6 +644,8 @@ def get():
 
 @rt("/runs/{run_id}")
 def get(run_id: int):
+    """Render one run with progress, leaderboard, logs, and matches."""
+
     with session() as db:
         run = db.get(Run, run_id)
         task = db.get(Task, run.task_id)
@@ -711,6 +769,8 @@ def get(run_id: int):
 
 @rt("/runs/{run_id}/rerun")
 def post(run_id: int):
+    """Reset and rerun a completed or failed run."""
+
     if run_id in RUN_THREADS and RUN_THREADS[run_id].is_alive():
         return RedirectResponse(f"/runs/{run_id}", status_code=303)
     with session() as db:
@@ -721,6 +781,8 @@ def post(run_id: int):
 
 @rt("/runs/{run_id}/recover")
 def post(run_id: int):
+    """Recover a paused or failed run without deleting completed outputs."""
+
     if run_id in RUN_THREADS and RUN_THREADS[run_id].is_alive():
         return RedirectResponse(f"/runs/{run_id}", status_code=303)
     with session() as db:
@@ -731,6 +793,8 @@ def post(run_id: int):
 
 @rt("/runs/{run_id}/stop")
 def post(run_id: int):
+    """Pause a running run."""
+
     with session() as db:
         stop_run(db, run_id)
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
@@ -738,6 +802,8 @@ def post(run_id: int):
 
 @rt("/runs/{run_id}/judge-pattern-analysis")
 def post(run_id: int):
+    """Generate a judge-pattern analysis summary for a run."""
+
     with session() as db:
         run = db.get(Run, run_id)
         if not run:
@@ -795,6 +861,8 @@ def post(run_id: int):
 
 @rt("/matches/{match_id}")
 def get(match_id: int):
+    """Render a single match detail page."""
+
     with session() as db:
         match = db.get(Match, match_id)
         transcript = db.get(Transcript, match.transcript_id)
@@ -838,6 +906,8 @@ def get(match_id: int):
 
 
 def run_table(runs):
+    """Render a compact table of runs."""
+
     return Table(
         Thead(Tr(Th("Run"), Th("Status"), Th("Created"), Th(""))),
         Tbody(
@@ -857,6 +927,8 @@ def run_table(runs):
 
 
 def progress_meter(label: str, complete: int, total: int):
+    """Render a simple completion bar with a count label."""
+
     pct = int((complete / total) * 100) if total else 0
     return Div(
         Div(Span(label), Span(f"{complete}/{total}"), cls="meter-label"),
@@ -866,6 +938,8 @@ def progress_meter(label: str, complete: int, total: int):
 
 
 def progress_breakdown(*, pending: int, running: int, failed: int):
+    """Render a compact breakdown of pending, running, and failed work."""
+
     return Div(
         Span(f"{running} running "),
         Span(f"{pending} pending "),
@@ -875,6 +949,8 @@ def progress_breakdown(*, pending: int, running: int, failed: int):
 
 
 def run_action_button(run: Run, label: str, action: str, *, subtle: bool = False):
+    """Render a one-click action form for run controls."""
+
     return Form(
         Button(label, type="submit", cls="button subtle" if subtle else None),
         action=action,
@@ -884,6 +960,8 @@ def run_action_button(run: Run, label: str, action: str, *, subtle: bool = False
 
 
 def analysis_action_button(run: Run, action: str):
+    """Render the judge-pattern analysis form."""
+
     return Form(
         Button("Judge Pattern Analysis", type="submit"),
         Span("", cls="analysis-progress", aria_live="polite"),
@@ -895,6 +973,8 @@ def analysis_action_button(run: Run, action: str):
 
 
 def judge_pattern_analysis_availability(run: Run, judge_votes: int) -> tuple[bool, str]:
+    """Decide whether judge-pattern analysis should be offered."""
+
     if run.status == Status.complete:
         return True, ""
     if run.status == Status.paused and judge_votes >= 10:
@@ -905,6 +985,8 @@ def judge_pattern_analysis_availability(run: Run, judge_votes: int) -> tuple[boo
 
 
 def run_console(logs):
+    """Render the run event log."""
+
     return Div(
         *[
             Div(
@@ -920,6 +1002,8 @@ def run_console(logs):
 
 
 def generation_throughput(db: Session, run_id: int) -> list[dict[str, str]]:
+    """Aggregate generation timing and token throughput by config."""
+
     rows = db.exec(
         select(Generation, GeneratorConfig)
         .where(Generation.run_id == run_id)
@@ -974,6 +1058,8 @@ def generation_throughput(db: Session, run_id: int) -> list[dict[str, str]]:
 
 
 def throughput_table(rows: list[dict[str, str]]):
+    """Render throughput metrics in a table."""
+
     return Table(
         Thead(Tr(Th("Config"), Th("Model"), Th("Calls"), Th("Avg TPS"), Th("Latest TPS"), Th("Avg Latency"), Th("Output Tok"), Th("Total Tok"))),
         Tbody(
@@ -997,6 +1083,8 @@ def throughput_table(rows: list[dict[str, str]]):
 
 
 def judgement_throughput(db: Session, run_id: int) -> list[dict[str, str]]:
+    """Aggregate judge timing and token throughput by config."""
+
     rows = db.exec(
         select(Judgement, JudgeConfig, Match)
         .where(Match.run_id == run_id)
@@ -1052,6 +1140,8 @@ def judgement_throughput(db: Session, run_id: int) -> list[dict[str, str]]:
 
 
 def judge_favorite_map(db: Session, run_id: int, judges: list[JudgeConfig]) -> dict[int, list[tuple[JudgeConfig, int]]]:
+    """Map each generator config to the judges that favor it most."""
+
     matches = db.exec(select(Match).where(Match.run_id == run_id, Match.status == Status.complete)).all()
     tallies: dict[int, dict[int, int]] = {judge.id: {} for judge in judges if judge.id is not None}
     judge_lookup = {judge.id: judge for judge in judges if judge.id is not None}
@@ -1093,6 +1183,8 @@ def judge_favorite_map(db: Session, run_id: int, judges: list[JudgeConfig]) -> d
 
 
 def judge_favorite_badges(config_id: int | None, favorites: dict[int, list[tuple[JudgeConfig, int]]]):
+    """Render badges that show which judges favored a config."""
+
     if config_id is None:
         return Span("None yet", cls="muted")
     badges = favorites.get(config_id, [])
@@ -1108,6 +1200,8 @@ def judge_favorite_badges(config_id: int | None, favorites: dict[int, list[tuple
 
 
 def analysis_history(analyses: list[RunAnalysis]):
+    """Render past judge-pattern analysis summaries."""
+
     return Div(
         *[
             Div(
@@ -1126,6 +1220,8 @@ def analysis_history(analyses: list[RunAnalysis]):
 
 
 def sample_judge_reasoning_traces(db: Session, run_id: int) -> list[dict[str, str]]:
+    """Sample a small set of judge reasoning traces for analysis."""
+
     rows = db.exec(
         select(Judgement, JudgeConfig, Match, GeneratorConfig)
         .where(Match.run_id == run_id)
@@ -1161,6 +1257,8 @@ def sample_judge_reasoning_traces(db: Session, run_id: int) -> list[dict[str, st
 
 
 def render_judge_pattern_prompt(traces: list[dict[str, str]]) -> str:
+    """Format sampled judge traces into the analyzer prompt body."""
+
     payload = "\n\n".join(
         f"Trace {index}\nJudge: {trace['judge']}\nMatch: {trace['match_id']}\nDirection: {trace['direction']}\nWinner: {trace['winner']}\nReasoning: {trace['reasoning']}"
         for index, trace in enumerate(traces, start=1)
@@ -1169,6 +1267,8 @@ def render_judge_pattern_prompt(traces: list[dict[str, str]]) -> str:
 
 
 def prompt_snapshot_group(title: str, configs):
+    """Render a collapsible prompt snapshot section."""
+
     group_key = title.lower().replace(" ", "-")
     return Details(
         Summary(title),
@@ -1198,6 +1298,8 @@ def prompt_snapshot_group(title: str, configs):
 
 
 def match_row(match_id: int):
+    """Render one row in the recent matches table."""
+
     with session() as db:
         match = db.get(Match, match_id)
         transcript = db.get(Transcript, match.transcript_id)
@@ -1217,6 +1319,8 @@ def match_row(match_id: int):
 
 
 def match_winner_label(winner: str, cfg_a: GeneratorConfig, cfg_b: GeneratorConfig) -> str:
+    """Map match winners back to the generator label that won."""
+
     if winner == "A":
         return cfg_a.label
     if winner == "B":
@@ -1225,6 +1329,8 @@ def match_winner_label(winner: str, cfg_a: GeneratorConfig, cfg_b: GeneratorConf
 
 
 def vote_summary(votes_json: str) -> str:
+    """Summarize raw vote JSON for table display."""
+
     try:
         votes = json.loads(votes_json)
     except Exception:
@@ -1233,6 +1339,8 @@ def vote_summary(votes_json: str) -> str:
 
 
 def build_generator_specs(rows: list[tuple[str, str, str, str]]) -> list[GeneratorSpec]:
+    """Convert form rows into generator specs and skip blank entries."""
+
     specs = []
     for label, model_id, temperature, prompt_path in rows:
         if not label.strip() and not model_id.strip():
@@ -1244,6 +1352,8 @@ def build_generator_specs(rows: list[tuple[str, str, str, str]]) -> list[Generat
 
 
 def build_judge_specs(rows: list[tuple[str, str, str, str]]) -> list[JudgeSpec]:
+    """Convert form rows into judge specs and skip blank entries."""
+
     specs = []
     for label, model_id, temperature, prompt_path in rows:
         if not label.strip() and not model_id.strip():
@@ -1255,10 +1365,14 @@ def build_judge_specs(rows: list[tuple[str, str, str, str]]) -> list[JudgeSpec]:
 
 
 def start_run_thread(run_id: int):
+    """Start a background thread for one run if it is not already active."""
+
     if run_id in RUN_THREADS and RUN_THREADS[run_id].is_alive():
         return
 
     def target():
+        """Run the background job and persist failures to the run row."""
+
         try:
             asyncio.run(execute_run(run_id, session))
         except Exception as exc:

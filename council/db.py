@@ -16,6 +16,8 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
 
 def init_db() -> None:
+    """Create tables and apply lightweight SQLite migrations in place."""
+
     SQLModel.metadata.create_all(engine)
     with engine.begin() as connection:
         generation_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(generation)").all()}
@@ -42,5 +44,7 @@ def init_db() -> None:
 
 
 def get_session() -> Generator[Session, None, None]:
+    """Yield a session bound to the shared application engine."""
+
     with Session(engine) as session:
         yield session

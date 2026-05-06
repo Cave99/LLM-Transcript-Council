@@ -15,6 +15,8 @@ load_dotenv()
 
 @dataclass
 class LLMResponse:
+    """Normalized response data returned from the OpenRouter chat API."""
+
     text: str
     raw: dict[str, Any]
     prompt_tokens: int | None = None
@@ -23,7 +25,11 @@ class LLMResponse:
 
 
 class OpenRouterClient:
+    """Tiny async client for the OpenRouter chat completions endpoint."""
+
     def __init__(self, *, timeout: float = 120.0) -> None:
+        """Read OpenRouter settings from the environment."""
+
         self.api_key = os.getenv("OPENROUTER_API_KEY", "")
         self.site_url = os.getenv("OPENROUTER_SITE_URL", "http://localhost:5001")
         self.app_name = os.getenv("OPENROUTER_APP_NAME", "LLM-Transcript-Council")
@@ -38,6 +44,8 @@ class OpenRouterClient:
         reasoning_effort: str | None = None,
         retries: int = 3,
     ) -> LLMResponse:
+        """Call OpenRouter chat completions with simple retry handling."""
+
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY is not set")
 

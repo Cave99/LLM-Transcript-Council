@@ -2,6 +2,8 @@ from council.files import read_text_snapshot
 
 
 def test_read_text_snapshot_hashes_content(tmp_path):
+    """Snapshot helper should preserve content and hash the file body."""
+
     path = tmp_path / "sample.md"
     path.write_text("hello", encoding="utf-8")
 
@@ -10,4 +12,3 @@ def test_read_text_snapshot_hashes_content(tmp_path):
     assert snapshot.content == "hello"
     assert len(snapshot.content_hash) == 64
     assert snapshot.path.endswith("sample.md")
-
