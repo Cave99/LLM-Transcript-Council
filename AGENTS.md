@@ -5,10 +5,11 @@ This repo is intentionally local, simple, and auditable. If you are an agent sta
 ## First Moves
 
 1. Read `README.md`.
-2. Inspect `council/runner.py` for the execution flow.
+2. Inspect `council/runner.py` for the top-level run lifecycle.
 3. Inspect `app.py` for the UI and route handlers.
-4. Look at the prompt files in `prompts/` before changing evaluation behavior.
-5. Run the tests that touch the area you edit.
+4. Inspect the phase module for the thing you are changing.
+5. Look at the prompt files in `prompts/` before changing evaluation behavior.
+6. Run the tests that touch the area you edit.
 
 ## Mental Model
 
@@ -22,14 +23,32 @@ This repo is intentionally local, simple, and auditable. If you are an agent sta
 
 ## Where To Look
 
-- Orchestration: `council/runner.py`
+- UI routes and rendering: `app.py`
+- Run lifecycle and public run actions: `council/runner.py`
+- Background thread startup: `council/jobs.py`
+- Derived work rows: `council/run_rows.py`
+- Generation phase: `council/generation.py`
+- Judging phase and swapped A/B calls: `council/judging.py`
+- Leaderboard persistence: `council/leaderboard.py`
+- Run progress, pause checks, and logs: `council/run_state.py`
+- Judge-pattern analysis: `council/analysis.py`
+- Read-only UI metrics and report queries: `council/reports.py`
 - Models and status enums: `council/models.py`
 - Prompt rendering and parsing: `council/judge.py`
 - ELO logic: `council/elo.py`
 - File snapshots: `council/files.py`
 - JSON helpers: `council/json_tools.py`
 - Database bootstrap: `council/db.py`
-- Local UI: `app.py`
+
+## Working Boundaries
+
+- Keep `app.py` calm: route handlers should validate, call a `council/` helper, and render or redirect.
+- Keep model calls out of request handlers. Use `council/jobs.py` for local background work.
+- Keep `council/runner.py` short. It should coordinate phases, not own phase details.
+- Put new generation behavior in `council/generation.py`.
+- Put new judge behavior in `council/judging.py`.
+- Put new analysis/reporting behavior in `council/analysis.py` or `council/reports.py`.
+- Put pure score math in `council/elo.py`; put persisted leaderboard changes in `council/leaderboard.py`.
 
 ## Editing Style
 

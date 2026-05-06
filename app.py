@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
-import os
-import random
-import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,8 +10,9 @@ from fasthtml.common import *
 from sqlmodel import Session, select
 
 from council.db import engine, init_db
-from council.elo import consistent_swapped_vote
+from council.analysis import judge_pattern_analysis_availability
 from council.files import list_markdown_files
+from council.jobs import run_thread_is_active, start_analysis_thread, start_run_thread
 from council.models import (
     EloRating,
     Generation,
@@ -32,6 +29,7 @@ from council.models import (
     Task,
     Transcript,
 )
+from council.reports import generation_throughput, judge_favorite_map, judgement_throughput
 from council.runner import (
     GeneratorSpec,
     JudgeSpec,
@@ -44,17 +42,8 @@ from council.runner import (
     reset_run,
     stop_run,
     create_task,
-    execute_run,
     run_progress,
 )
-from council.openrouter import OpenRouterClient
-
-
-JUDGE_PATTERN_ANALYSIS_PROMPT = """You analyze LLM-as-judge reasoning traces from a completed evaluation run.
-
-Write one brief paragraph describing the strongest patterns in judge preferences. Focus on trends such as whether judges favor longer or shorter responses, stricter JSON/schema adherence, more transcript evidence, more specific recommendations, tone, risk awareness, or other repeated choice drivers.
-
-Use only the provided traces. Be concrete but concise. Do not list every trace. Do not mention internal sampling mechanics."""
 
 load_dotenv()
 init_db()
@@ -65,9 +54,6 @@ app, rt = fast_app(
         Script(src="/static/app.js"),
     )
 )
-
-RUN_THREADS: dict[int, threading.Thread] = {}
-
 
 def session() -> Session:
     """Return a short-lived database session for request handlers."""
@@ -629,7 +615,7 @@ def post(
             swap_enabled=swap_enabled == "true",
         )
         run_id = run.id
-    start_run_thread(run_id)
+    start_run_thread(run_id, session)
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
@@ -771,11 +757,11 @@ def get(run_id: int):
 def post(run_id: int):
     """Reset and rerun a completed or failed run."""
 
-    if run_id in RUN_THREADS and RUN_THREADS[run_id].is_alive():
+    if run_thread_is_active(run_id):
         return RedirectResponse(f"/runs/{run_id}", status_code=303)
     with session() as db:
         reset_run(db, run_id)
-    start_run_thread(run_id)
+    start_run_thread(run_id, session)
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
@@ -783,11 +769,11 @@ def post(run_id: int):
 def post(run_id: int):
     """Recover a paused or failed run without deleting completed outputs."""
 
-    if run_id in RUN_THREADS and RUN_THREADS[run_id].is_alive():
+    if run_thread_is_active(run_id):
         return RedirectResponse(f"/runs/{run_id}", status_code=303)
     with session() as db:
         recover_run(db, run_id)
-    start_run_thread(run_id)
+    start_run_thread(run_id, session)
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
@@ -802,60 +788,9 @@ def post(run_id: int):
 
 @rt("/runs/{run_id}/judge-pattern-analysis")
 def post(run_id: int):
-    """Generate a judge-pattern analysis summary for a run."""
+    """Queue a judge-pattern analysis summary for a run."""
 
-    with session() as db:
-        run = db.get(Run, run_id)
-        if not run:
-            return RedirectResponse(f"/runs/{run_id}", status_code=303)
-        progress = run_progress(db, run_id)
-        analysis_allowed, _analysis_help = judge_pattern_analysis_availability(run, progress["judgements"])
-        if not analysis_allowed:
-            return RedirectResponse(f"/runs/{run_id}", status_code=303)
-        traces = sample_judge_reasoning_traces(db, run_id)
-        if not traces:
-            run.error = "No judge reasoning traces are available for pattern analysis."
-            db.add(run)
-            db.commit()
-            return RedirectResponse(f"/runs/{run_id}", status_code=303)
-        model_id = os.getenv("JUDGE_PATTERN_ANALYZER_MODEL", "deepseek/deepseek-v4-flash")
-
-    prompt = render_judge_pattern_prompt(traces)
-    try:
-        response = asyncio.run(
-            OpenRouterClient().chat(
-                model=model_id,
-                temperature=0.2,
-                reasoning_effort="low",
-                messages=[
-                    {"role": "system", "content": JUDGE_PATTERN_ANALYSIS_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-        )
-        summary = response.text.strip()
-        with session() as db:
-            run = db.get(Run, run_id)
-            if run:
-                run.error = None
-                db.add(run)
-            db.add(
-                RunAnalysis(
-                    run_id=run_id,
-                    model_id=model_id,
-                    sample_size=len(traces),
-                    summary=summary,
-                    prompt_snapshot=JUDGE_PATTERN_ANALYSIS_PROMPT,
-                )
-            )
-            db.commit()
-    except Exception as exc:
-        with session() as db:
-            run = db.get(Run, run_id)
-            if run:
-                run.error = f"Judge pattern analysis failed: {exc}"
-                db.add(run)
-                db.commit()
+    start_analysis_thread(run_id, session)
     return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
@@ -972,18 +907,6 @@ def analysis_action_button(run: Run, action: str):
     )
 
 
-def judge_pattern_analysis_availability(run: Run, judge_votes: int) -> tuple[bool, str]:
-    """Decide whether judge-pattern analysis should be offered."""
-
-    if run.status == Status.complete:
-        return True, ""
-    if run.status == Status.paused and judge_votes >= 10:
-        return True, ""
-    if run.status == Status.paused:
-        return False, f"Judge pattern analysis needs at least 10 judge votes for a stopped run. Current votes: {judge_votes}."
-    return False, "Judge pattern analysis is available after completion, or after stopping once at least 10 judge votes exist."
-
-
 def run_console(logs):
     """Render the run event log."""
 
@@ -999,62 +922,6 @@ def run_console(logs):
         or [P("No run events yet.", cls="muted")],
         cls="run-console",
     )
-
-
-def generation_throughput(db: Session, run_id: int) -> list[dict[str, str]]:
-    """Aggregate generation timing and token throughput by config."""
-
-    rows = db.exec(
-        select(Generation, GeneratorConfig)
-        .where(Generation.run_id == run_id)
-        .where(Generation.generator_config_id == GeneratorConfig.id)
-        .where(Generation.status == Status.complete)
-    ).all()
-    by_config: dict[int, dict] = {}
-    for generation, config in rows:
-        if not generation.started_at or not generation.completed_at:
-            continue
-        seconds = max((generation.completed_at - generation.started_at).total_seconds(), 0.001)
-        output_tokens = generation.completion_tokens or 0
-        total_tokens = (generation.prompt_tokens or 0) + output_tokens
-        bucket = by_config.setdefault(
-            config.id,
-            {
-                "label": config.label,
-                "model": config.model_id,
-                "calls": 0,
-                "seconds": 0.0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "recent_completed_at": None,
-                "recent_tps": 0.0,
-            },
-        )
-        bucket["calls"] += 1
-        bucket["seconds"] += seconds
-        bucket["output_tokens"] += output_tokens
-        bucket["total_tokens"] += total_tokens
-        if not bucket["recent_completed_at"] or generation.completed_at > bucket["recent_completed_at"]:
-            bucket["recent_completed_at"] = generation.completed_at
-            bucket["recent_tps"] = output_tokens / seconds if output_tokens else 0.0
-
-    metrics = []
-    for bucket in by_config.values():
-        avg_tps = bucket["output_tokens"] / bucket["seconds"] if bucket["seconds"] else 0.0
-        avg_latency = bucket["seconds"] / bucket["calls"] if bucket["calls"] else 0.0
-        metrics.append(
-            {
-                "label": bucket["label"],
-                "model": bucket["model"],
-                "calls": str(bucket["calls"]),
-                "avg_tps": f"{avg_tps:.1f}",
-                "recent_tps": f"{bucket['recent_tps']:.1f}",
-                "avg_latency": f"{avg_latency:.1f}s",
-                "output_tokens": f"{bucket['output_tokens']:,}",
-                "total_tokens": f"{bucket['total_tokens']:,}",
-            }
-        )
-    return sorted(metrics, key=lambda row: float(row["avg_tps"]), reverse=True)
 
 
 def throughput_table(rows: list[dict[str, str]]):
@@ -1080,106 +947,6 @@ def throughput_table(rows: list[dict[str, str]]):
         ),
         cls="throughput-table",
     )
-
-
-def judgement_throughput(db: Session, run_id: int) -> list[dict[str, str]]:
-    """Aggregate judge timing and token throughput by config."""
-
-    rows = db.exec(
-        select(Judgement, JudgeConfig, Match)
-        .where(Match.run_id == run_id)
-        .where(Judgement.match_id == Match.id)
-        .where(Judgement.judge_config_id == JudgeConfig.id)
-        .where(Judgement.error == None)  # noqa: E711
-    ).all()
-    by_config: dict[int, dict] = {}
-    for judgement, judge, _match in rows:
-        if not judgement.started_at or not judgement.completed_at:
-            continue
-        seconds = max((judgement.completed_at - judgement.started_at).total_seconds(), 0.001)
-        output_tokens = judgement.completion_tokens or 0
-        total_tokens = (judgement.prompt_tokens or 0) + output_tokens
-        bucket = by_config.setdefault(
-            judge.id,
-            {
-                "label": judge.label,
-                "model": judge.model_id,
-                "calls": 0,
-                "seconds": 0.0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "recent_completed_at": None,
-                "recent_tps": 0.0,
-            },
-        )
-        bucket["calls"] += 1
-        bucket["seconds"] += seconds
-        bucket["output_tokens"] += output_tokens
-        bucket["total_tokens"] += total_tokens
-        if not bucket["recent_completed_at"] or judgement.completed_at > bucket["recent_completed_at"]:
-            bucket["recent_completed_at"] = judgement.completed_at
-            bucket["recent_tps"] = output_tokens / seconds if output_tokens else 0.0
-
-    metrics = []
-    for bucket in by_config.values():
-        avg_tps = bucket["output_tokens"] / bucket["seconds"] if bucket["seconds"] else 0.0
-        avg_latency = bucket["seconds"] / bucket["calls"] if bucket["calls"] else 0.0
-        metrics.append(
-            {
-                "label": bucket["label"],
-                "model": bucket["model"],
-                "calls": str(bucket["calls"]),
-                "avg_tps": f"{avg_tps:.1f}",
-                "recent_tps": f"{bucket['recent_tps']:.1f}",
-                "avg_latency": f"{avg_latency:.1f}s",
-                "output_tokens": f"{bucket['output_tokens']:,}",
-                "total_tokens": f"{bucket['total_tokens']:,}",
-            }
-        )
-    return sorted(metrics, key=lambda row: float(row["avg_tps"]), reverse=True)
-
-
-def judge_favorite_map(db: Session, run_id: int, judges: list[JudgeConfig]) -> dict[int, list[tuple[JudgeConfig, int]]]:
-    """Map each generator config to the judges that favor it most."""
-
-    matches = db.exec(select(Match).where(Match.run_id == run_id, Match.status == Status.complete)).all()
-    tallies: dict[int, dict[int, int]] = {judge.id: {} for judge in judges if judge.id is not None}
-    judge_lookup = {judge.id: judge for judge in judges if judge.id is not None}
-
-    for match in matches:
-        for judge_id in judge_lookup:
-            normal = db.exec(
-                select(Judgement).where(
-                    Judgement.match_id == match.id,
-                    Judgement.judge_config_id == judge_id,
-                    Judgement.direction == "normal",
-                )
-            ).first()
-            swapped = db.exec(
-                select(Judgement).where(
-                    Judgement.match_id == match.id,
-                    Judgement.judge_config_id == judge_id,
-                    Judgement.direction == "swapped",
-                )
-            ).first()
-            if not normal or not swapped:
-                continue
-            winner = consistent_swapped_vote(normal.winner, swapped.winner)
-            if winner == "A":
-                config_id = match.config_a_id
-            elif winner == "B":
-                config_id = match.config_b_id
-            else:
-                continue
-            tallies[judge_id][config_id] = tallies[judge_id].get(config_id, 0) + 1
-
-    favorites: dict[int, list[tuple[JudgeConfig, int]]] = {}
-    for judge_id, config_counts in tallies.items():
-        if not config_counts:
-            continue
-        favorite_id, wins = max(config_counts.items(), key=lambda item: item[1])
-        favorites.setdefault(favorite_id, []).append((judge_lookup[judge_id], wins))
-    return favorites
 
 
 def judge_favorite_badges(config_id: int | None, favorites: dict[int, list[tuple[JudgeConfig, int]]]):
@@ -1217,53 +984,6 @@ def analysis_history(analyses: list[RunAnalysis]):
         ],
         cls="analysis-history",
     ) if analyses else P("No judge pattern analysis yet.", cls="muted")
-
-
-def sample_judge_reasoning_traces(db: Session, run_id: int) -> list[dict[str, str]]:
-    """Sample a small set of judge reasoning traces for analysis."""
-
-    rows = db.exec(
-        select(Judgement, JudgeConfig, Match, GeneratorConfig)
-        .where(Match.run_id == run_id)
-        .where(Judgement.match_id == Match.id)
-        .where(Judgement.judge_config_id == JudgeConfig.id)
-        .where(Judgement.error == None)  # noqa: E711
-        .where(GeneratorConfig.id == Match.config_a_id)
-    ).all()
-    traces = [
-        {
-            "judge": judge.model_id,
-            "direction": judgement.direction,
-            "winner": judgement.winner,
-            "reasoning": judgement.reasoning,
-            "match_id": str(match.id),
-        }
-        for judgement, judge, match, _config_a in rows
-        if judgement.reasoning.strip()
-    ]
-    sample_size = max(1, round(len(traces) * 0.10)) if traces else 0
-    rng = random.Random(run_id)
-    by_judge: dict[str, list[dict[str, str]]] = {}
-    for trace in traces:
-        by_judge.setdefault(trace["judge"], []).append(trace)
-    sampled: list[dict[str, str]] = []
-    judge_names = list(by_judge)
-    rng.shuffle(judge_names)
-    while len(sampled) < sample_size and any(by_judge.values()):
-        for judge_name in judge_names:
-            if by_judge[judge_name] and len(sampled) < sample_size:
-                sampled.append(by_judge[judge_name].pop(rng.randrange(len(by_judge[judge_name]))))
-    return sampled
-
-
-def render_judge_pattern_prompt(traces: list[dict[str, str]]) -> str:
-    """Format sampled judge traces into the analyzer prompt body."""
-
-    payload = "\n\n".join(
-        f"Trace {index}\nJudge: {trace['judge']}\nMatch: {trace['match_id']}\nDirection: {trace['direction']}\nWinner: {trace['winner']}\nReasoning: {trace['reasoning']}"
-        for index, trace in enumerate(traces, start=1)
-    )
-    return f"Sampled judge reasoning traces:\n\n{payload}\n\nWrite the one-paragraph trend analysis now."
 
 
 def prompt_snapshot_group(title: str, configs):
@@ -1362,31 +1082,6 @@ def build_judge_specs(rows: list[tuple[str, str, str, str]]) -> list[JudgeSpec]:
             continue
         specs.append(JudgeSpec(label.strip(), model_id.strip(), float(temperature or 0.0), prompt_path.strip()))
     return specs
-
-
-def start_run_thread(run_id: int):
-    """Start a background thread for one run if it is not already active."""
-
-    if run_id in RUN_THREADS and RUN_THREADS[run_id].is_alive():
-        return
-
-    def target():
-        """Run the background job and persist failures to the run row."""
-
-        try:
-            asyncio.run(execute_run(run_id, session))
-        except Exception as exc:
-            with session() as db:
-                run = db.get(Run, run_id)
-                if run:
-                    run.status = Status.failed
-                    run.error = str(exc)
-                    db.add(run)
-                    db.commit()
-
-    thread = threading.Thread(target=target, daemon=True)
-    RUN_THREADS[run_id] = thread
-    thread.start()
 
 
 if __name__ == "__main__":

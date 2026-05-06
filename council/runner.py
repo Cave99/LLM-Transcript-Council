@@ -1,24 +1,18 @@
-"""Run creation and execution orchestration."""
+"""Run creation and high-level execution orchestration."""
 
 from __future__ import annotations
 
 import asyncio
-import itertools
-import json
-import random
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlmodel import Session, delete, select
 
-from council.elo import consistent_swapped_vote, majority_vote, update_elo
 from council.files import list_markdown_files, read_text_snapshot
-from council.judge import (
-    parse_judgement_response,
-    render_generation_prompt,
-    render_judge_prompt,
-)
-from council.json_tools import maybe_repair_json
+from council.generation import run_generations
+from council.judging import run_matches
+from council.leaderboard import apply_match_elo as _apply_match_elo
+from council.leaderboard import recalculate_elo
 from council.models import (
     EloRating,
     Generation,
@@ -37,6 +31,8 @@ from council.models import (
     utc_now,
 )
 from council.openrouter import OpenRouterClient
+from council.run_rows import ensure_elo_rows, ensure_generation_rows, ensure_match_rows
+from council.run_state import add_run_log, is_run_paused, run_progress
 
 
 @dataclass(frozen=True)
@@ -163,7 +159,7 @@ def create_run(
     max_concurrency: int = 5,
     swap_enabled: bool = True,
 ) -> Run:
-    """Create a run, snapshot all inputs, and prebuild generation and match rows."""
+    """Create a run, snapshot all inputs, and prebuild work rows."""
 
     task = session.get(Task, task_id)
     if not task:
@@ -231,9 +227,9 @@ def create_run(
         )
 
     session.commit()
-    _ensure_generation_rows(session, run.id)
-    _ensure_match_rows(session, run.id)
-    _ensure_elo_rows(session, run.id)
+    ensure_generation_rows(session, run.id)
+    ensure_match_rows(session, run.id)
+    ensure_elo_rows(session, run.id)
     return run
 
 
@@ -335,59 +331,6 @@ def stop_run(session: Session, run_id: int) -> Run:
     return run
 
 
-def add_run_log(session: Session, run_id: int, message: str, *, level: str = "info") -> None:
-    """Store a run log row and mirror it to stdout for easy debugging."""
-
-    session.add(RunLog(run_id=run_id, level=level, message=message))
-    print(f"[run {run_id}] {level.upper()}: {message}", flush=True)
-
-
-def is_run_paused(session: Session, run_id: int) -> bool:
-    """Return whether the run is currently paused."""
-
-    run = session.get(Run, run_id)
-    return bool(run and run.status == Status.paused)
-
-
-def run_progress(session: Session, run_id: int) -> dict[str, int]:
-    """Return a compact progress summary for the run detail page."""
-
-    def count(model, status: Status | None = None) -> int:
-        """Count rows for one run, optionally filtered by status."""
-
-        statement = select(model).where(model.run_id == run_id)
-        if status:
-            statement = statement.where(model.status == status)
-        return len(session.exec(statement).all())
-
-    generations = count(Generation)
-    matches = count(Match)
-    complete_generations = count(Generation, Status.complete)
-    complete_matches = count(Match, Status.complete)
-    pending_generations = count(Generation, Status.pending)
-    running_generations = count(Generation, Status.running)
-    failed_generations = count(Generation, Status.failed)
-    pending_matches = count(Match, Status.pending)
-    running_matches = count(Match, Status.running)
-    failed_matches = count(Match, Status.failed)
-    judgements = session.exec(
-        select(Judgement).join(Match).where(Match.run_id == run_id)
-    ).all()
-    return {
-        "generations": generations,
-        "generations_complete": complete_generations,
-        "generations_pending": pending_generations,
-        "generations_running": running_generations,
-        "generations_failed": failed_generations,
-        "matches": matches,
-        "matches_complete": complete_matches,
-        "matches_pending": pending_matches,
-        "matches_running": running_matches,
-        "matches_failed": failed_matches,
-        "judgements": len(judgements),
-    }
-
-
 async def execute_run(run_id: int, session_factory, client: OpenRouterClient | None = None) -> None:
     """Execute the full generation, judging, and leaderboard pipeline."""
 
@@ -414,20 +357,20 @@ async def execute_run(run_id: int, session_factory, client: OpenRouterClient | N
         max_concurrency = run.max_concurrency
 
     semaphore = asyncio.Semaphore(max_concurrency)
-    await _run_generations(run_id, session_factory, client, semaphore)
+    await run_generations(run_id, session_factory, client, semaphore)
     with session_factory() as session:
         if is_run_paused(session, run_id):
             add_run_log(session, run_id, "Run paused before judging. Completed generation outputs were kept.")
             session.commit()
             return
-    await _run_matches(run_id, session_factory, client, semaphore)
+    await run_matches(run_id, session_factory, client, semaphore)
 
     with session_factory() as session:
         if is_run_paused(session, run_id):
             add_run_log(session, run_id, "Run paused before leaderboard recalculation.")
             session.commit()
             return
-        _recalculate_elo(session, run_id)
+        recalculate_elo(session, run_id)
         run = session.get(Run, run_id)
         if run:
             run.status = Status.complete
@@ -435,465 +378,3 @@ async def execute_run(run_id: int, session_factory, client: OpenRouterClient | N
             session.add(run)
             add_run_log(session, run_id, "Run complete. Leaderboard recalculated.")
             session.commit()
-
-
-def _ensure_generation_rows(session: Session, run_id: int) -> None:
-    """Create any missing generation rows for transcript/config combinations."""
-
-    transcripts = session.exec(select(Transcript).where(Transcript.run_id == run_id)).all()
-    configs = session.exec(select(GeneratorConfig).where(GeneratorConfig.run_id == run_id)).all()
-    existing = {
-        (row.transcript_id, row.generator_config_id)
-        for row in session.exec(select(Generation).where(Generation.run_id == run_id)).all()
-    }
-    for transcript, config in itertools.product(transcripts, configs):
-        if (transcript.id, config.id) not in existing:
-            session.add(
-                Generation(
-                    run_id=run_id,
-                    transcript_id=transcript.id,
-                    generator_config_id=config.id,
-                )
-            )
-    session.commit()
-
-
-def _ensure_match_rows(session: Session, run_id: int) -> None:
-    """Create any missing match rows for the current run configuration."""
-
-    run = session.get(Run, run_id)
-    transcripts = session.exec(select(Transcript).where(Transcript.run_id == run_id)).all()
-    configs = session.exec(select(GeneratorConfig).where(GeneratorConfig.run_id == run_id)).all()
-    existing = {
-        (row.transcript_id, row.config_a_id, row.config_b_id)
-        for row in session.exec(select(Match).where(Match.run_id == run_id)).all()
-    }
-    generations = session.exec(select(Generation).where(Generation.run_id == run_id)).all()
-    generation_lookup = {
-        (generation.transcript_id, generation.generator_config_id): generation
-        for generation in generations
-    }
-    for transcript in transcripts:
-        pairings = list(itertools.combinations(configs, 2))
-        sample_pct = run.pairing_sample_pct if run else 100.0
-        if sample_pct < 100.0 and pairings:
-            sample_count = max(1, round(len(pairings) * (sample_pct / 100.0)))
-            rng = random.Random(f"{run_id}:{transcript.id}:{sample_pct}")
-            pairings = rng.sample(pairings, min(sample_count, len(pairings)))
-        for config_a, config_b in pairings:
-            if (transcript.id, config_a.id, config_b.id) in existing:
-                continue
-            gen_a = generation_lookup[(transcript.id, config_a.id)]
-            gen_b = generation_lookup[(transcript.id, config_b.id)]
-            session.add(
-                Match(
-                    run_id=run_id,
-                    transcript_id=transcript.id,
-                    generation_a_id=gen_a.id,
-                    generation_b_id=gen_b.id,
-                    config_a_id=config_a.id,
-                    config_b_id=config_b.id,
-                )
-            )
-    session.commit()
-
-
-def _ensure_elo_rows(session: Session, run_id: int) -> None:
-    """Create missing leaderboard rows for each generator config."""
-
-    run = session.get(Run, run_id)
-    configs = session.exec(select(GeneratorConfig).where(GeneratorConfig.run_id == run_id)).all()
-    existing = {
-        row.generator_config_id
-        for row in session.exec(select(EloRating).where(EloRating.run_id == run_id)).all()
-    }
-    for config in configs:
-        if config.id not in existing:
-            session.add(
-                EloRating(
-                    run_id=run_id,
-                    generator_config_id=config.id,
-                    rating=run.elo_start if run else 1500.0,
-                )
-            )
-    session.commit()
-
-
-async def _run_generations(run_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
-    """Queue and execute every incomplete generation in parallel."""
-
-    with session_factory() as session:
-        generation_ids = [
-            row.id
-            for row in session.exec(
-                select(Generation).where(
-                    Generation.run_id == run_id,
-                    Generation.status != Status.complete,
-                )
-            ).all()
-            if row.id is not None
-        ]
-        add_run_log(session, run_id, f"Generation phase queued {len(generation_ids)} incomplete calls.")
-        session.commit()
-    await asyncio.gather(*[_generate_one(generation_id, session_factory, client, semaphore) for generation_id in generation_ids])
-
-
-async def _run_matches(run_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
-    """Queue and execute match judging one pair at a time."""
-
-    with session_factory() as session:
-        match_ids = [
-            row.id
-            for row in session.exec(
-                select(Match).where(Match.run_id == run_id, Match.status != Status.complete)
-            ).all()
-            if row.id is not None
-        ]
-        add_run_log(session, run_id, f"Judging phase queued {len(match_ids)} incomplete matches.")
-        session.commit()
-    for match_id in match_ids:
-        with session_factory() as session:
-            if is_run_paused(session, run_id):
-                add_run_log(session, run_id, "Judging phase stopped before scheduling the next match.")
-                session.commit()
-                return
-        await _judge_match(match_id, session_factory, client, semaphore)
-
-
-async def _generate_one(generation_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
-    """Run one generator call and persist either the output or failure."""
-
-    async with semaphore:
-        with session_factory() as session:
-            generation = session.get(Generation, generation_id)
-            if not generation:
-                return
-            if is_run_paused(session, generation.run_id):
-                return
-            if generation.status == Status.complete:
-                return
-            run = session.get(Run, generation.run_id)
-            task = session.get(Task, run.task_id)
-            transcript = session.get(Transcript, generation.transcript_id)
-            config = session.get(GeneratorConfig, generation.generator_config_id)
-            run_id = generation.run_id
-            task_description = task.description_snapshot
-            transcript_content = transcript.content_snapshot
-            prompt_snapshot = config.prompt_snapshot
-            model_id = config.model_id
-            temperature = config.temperature
-            transcript_name = Path(transcript.path).name
-            config_label = config.label
-            generation.status = Status.running
-            generation.started_at = utc_now()
-            session.add(generation)
-            add_run_log(session, run_id, f"Generation started: {config_label} on {transcript_name}.")
-            session.commit()
-
-        prompt = render_generation_prompt(
-            prompt_snapshot,
-            transcript=transcript_content,
-            task_description=task_description,
-        )
-        try:
-            response = await client.chat(
-                model=model_id,
-                temperature=temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            with session_factory() as session:
-                generation = session.get(Generation, generation_id)
-                run_id = generation.run_id
-                generation.status = Status.complete
-                generation.output_raw = response.text
-                generation.output_repaired = maybe_repair_json(response.text)
-                generation.prompt_tokens = response.prompt_tokens
-                generation.completion_tokens = response.completion_tokens
-                generation.cost = response.cost
-                generation.completed_at = utc_now()
-                session.add(generation)
-                add_run_log(session, run_id, f"Generation complete: {model_id} on generation #{generation_id}.")
-                session.commit()
-        except Exception as exc:
-            with session_factory() as session:
-                generation = session.get(Generation, generation_id)
-                run_id = generation.run_id if generation else 0
-                if generation:
-                    generation.status = Status.failed
-                    generation.error = str(exc)
-                    session.add(generation)
-                add_run_log(session, run_id, f"Generation failed: {model_id} on generation #{generation_id}: {exc}", level="error")
-                session.commit()
-
-
-async def _judge_match(match_id: int, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
-    """Run all judges for one match and store the final match result."""
-
-    with session_factory() as session:
-        match = session.get(Match, match_id)
-        if not match or match.status == Status.complete:
-            return
-        run = session.get(Run, match.run_id)
-        task = session.get(Task, run.task_id)
-        transcript = session.get(Transcript, match.transcript_id)
-        gen_a = session.get(Generation, match.generation_a_id)
-        gen_b = session.get(Generation, match.generation_b_id)
-        judges = session.exec(select(JudgeConfig).where(JudgeConfig.run_id == run.id)).all()
-        judge_ids = [judge.id for judge in judges]
-        task_description = task.description_snapshot
-        transcript_content = transcript.content_snapshot
-        output_a = gen_a.output_repaired or gen_a.output_raw or ""
-        output_b = gen_b.output_repaired or gen_b.output_raw or ""
-        gen_a_status = gen_a.status
-        gen_b_status = gen_b.status
-        match.status = Status.running
-        session.add(match)
-        add_run_log(session, run.id, f"Match started: #{match.id} with {len(judge_ids)} judges.")
-        session.commit()
-
-    if gen_a_status != Status.complete or gen_b_status != Status.complete:
-        with session_factory() as session:
-            match = session.get(Match, match_id)
-            match.status = Status.failed
-            session.add(match)
-            add_run_log(session, match.run_id, f"Match skipped: #{match_id} is waiting on incomplete generations.", level="warning")
-            session.commit()
-        return
-
-    votes: list[str] = []
-    tasks = [
-        _judge_with_swap(
-            match_id,
-            judge_id,
-            task_description,
-            transcript_content,
-            output_a,
-            output_b,
-            session_factory,
-            client,
-            semaphore,
-        )
-        for judge_id in judge_ids
-    ]
-    votes = list(await asyncio.gather(*tasks))
-    final = majority_vote([vote for vote in votes if vote in {"A", "B", "TIE"}])
-    agreement = votes.count(final) / len(votes) if votes else 0.0
-
-    with session_factory() as session:
-        result = MatchResult(
-            match_id=match_id,
-            final_winner=final,
-            agreement=agreement,
-            votes_json=json.dumps(votes),
-        )
-        session.add(result)
-        match = session.get(Match, match_id)
-        match.status = Status.complete
-        session.add(match)
-        _apply_match_elo(session, match, final)
-        add_run_log(session, match.run_id, f"Match complete: #{match_id}, winner={final}, agreement={agreement:.0%}.")
-        session.commit()
-
-
-async def _judge_with_swap(
-    match_id: int,
-    judge_id: int,
-    task_description: str,
-    transcript: str,
-    output_a: str,
-    output_b: str,
-    session_factory,
-    client: OpenRouterClient,
-    semaphore: asyncio.Semaphore,
-) -> str:
-    """Run a judge twice, then reconcile the swapped vote back to one result."""
-
-    first = await _judge_once(
-        match_id,
-        judge_id,
-        "normal",
-        task_description,
-        transcript,
-        output_a,
-        output_b,
-        session_factory,
-        client,
-        semaphore,
-    )
-    swapped = await _judge_once(
-        match_id,
-        judge_id,
-        "swapped",
-        task_description,
-        transcript,
-        output_b,
-        output_a,
-        session_factory,
-        client,
-        semaphore,
-    )
-    return consistent_swapped_vote(first, swapped)
-
-
-async def _judge_once(
-    match_id: int,
-    judge_id: int,
-    direction: str,
-    task_description: str,
-    transcript: str,
-    output_a: str,
-    output_b: str,
-    session_factory,
-    client: OpenRouterClient,
-    semaphore: asyncio.Semaphore,
-) -> str:
-    """Run one judge prompt and persist the raw vote and reasoning."""
-
-    with session_factory() as session:
-        existing = session.exec(
-            select(Judgement).where(
-                Judgement.match_id == match_id,
-                Judgement.judge_config_id == judge_id,
-                Judgement.direction == direction,
-            )
-        ).first()
-        if existing and not existing.error:
-            return existing.winner
-        judge = session.get(JudgeConfig, judge_id)
-        prompt_snapshot = judge.prompt_snapshot
-        model_id = judge.model_id
-        temperature = judge.temperature
-
-    prompt = render_judge_prompt(
-        prompt_snapshot,
-        task_description=task_description,
-        transcript=transcript,
-        output_a=output_a,
-        output_b=output_b,
-    )
-    started_at = utc_now()
-    try:
-        async with semaphore:
-            response = await client.chat(
-                model=model_id,
-                temperature=temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        parsed = parse_judgement_response(response.text)
-        with session_factory() as session:
-            session.add(
-                Judgement(
-                    match_id=match_id,
-                    judge_config_id=judge_id,
-                    direction=direction,
-                    winner=parsed.winner,
-                    reasoning=parsed.reasoning,
-                    raw_response=response.text,
-                    prompt_tokens=response.prompt_tokens,
-                    completion_tokens=response.completion_tokens,
-                    cost=response.cost,
-                    started_at=started_at,
-                    completed_at=utc_now(),
-                )
-            )
-            match = session.get(Match, match_id)
-            add_run_log(session, match.run_id, f"Judge vote recorded: judge #{judge_id}, match #{match_id}, {direction}, winner={parsed.winner}.")
-            session.commit()
-        return parsed.winner
-    except Exception as exc:
-        with session_factory() as session:
-            session.add(
-                Judgement(
-                    match_id=match_id,
-                    judge_config_id=judge_id,
-                    direction=direction,
-                    winner="TIE",
-                    reasoning="Judge call failed; counted as tie.",
-                    raw_response="",
-                    error=str(exc),
-                    started_at=started_at,
-                    completed_at=utc_now(),
-                )
-            )
-            match = session.get(Match, match_id)
-            add_run_log(session, match.run_id, f"Judge call failed: judge #{judge_id}, match #{match_id}, {direction}: {exc}", level="error")
-            session.commit()
-        return "TIE"
-
-
-def _recalculate_elo(session: Session, run_id: int) -> None:
-    """Rebuild the leaderboard from completed match results."""
-
-    run = session.get(Run, run_id)
-    ratings = {
-        row.generator_config_id: row
-        for row in session.exec(select(EloRating).where(EloRating.run_id == run_id)).all()
-    }
-    for row in ratings.values():
-        row.rating = run.elo_start if run else 1500.0
-        row.wins = row.losses = row.ties = 0
-        session.add(row)
-
-    matches = session.exec(select(Match).where(Match.run_id == run_id, Match.status == Status.complete)).all()
-    for match in matches:
-        result = session.exec(select(MatchResult).where(MatchResult.match_id == match.id)).first()
-        if not result:
-            continue
-        rating_a = ratings[match.config_a_id]
-        rating_b = ratings[match.config_b_id]
-        rating_a.rating, rating_b.rating = update_elo(
-            rating_a.rating,
-            rating_b.rating,
-            result.final_winner,  # type: ignore[arg-type]
-            k_factor=run.k_factor if run else 32.0,
-        )
-        if result.final_winner == "A":
-            rating_a.wins += 1
-            rating_b.losses += 1
-        elif result.final_winner == "B":
-            rating_b.wins += 1
-            rating_a.losses += 1
-        else:
-            rating_a.ties += 1
-            rating_b.ties += 1
-        session.add(rating_a)
-        session.add(rating_b)
-    session.commit()
-
-
-def _apply_match_elo(session: Session, match: Match, final_winner: str) -> None:
-    """Apply one completed match result to the live leaderboard rows."""
-
-    run = session.get(Run, match.run_id)
-    rating_a = session.exec(
-        select(EloRating).where(
-            EloRating.run_id == match.run_id,
-            EloRating.generator_config_id == match.config_a_id,
-        )
-    ).first()
-    rating_b = session.exec(
-        select(EloRating).where(
-            EloRating.run_id == match.run_id,
-            EloRating.generator_config_id == match.config_b_id,
-        )
-    ).first()
-    if not rating_a or not rating_b:
-        return
-
-    rating_a.rating, rating_b.rating = update_elo(
-        rating_a.rating,
-        rating_b.rating,
-        final_winner,  # type: ignore[arg-type]
-        k_factor=run.k_factor if run else 32.0,
-    )
-    if final_winner == "A":
-        rating_a.wins += 1
-        rating_b.losses += 1
-    elif final_winner == "B":
-        rating_b.wins += 1
-        rating_a.losses += 1
-    else:
-        rating_a.ties += 1
-        rating_b.ties += 1
-    session.add(rating_a)
-    session.add(rating_b)

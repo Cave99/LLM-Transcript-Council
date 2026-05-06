@@ -2,7 +2,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from council.models import EloRating, Generation, GeneratorConfig, JudgeConfig, Judgement, Match, MatchResult, Project, Run, RunAnalysis, RunLog, Status, Task, Transcript
 from council.runner import GeneratorSpec, JudgeSpec, _apply_match_elo, create_project, create_run, create_task, delete_project, delete_task, recover_run, rename_project, reset_run, stop_run
-from app import judge_pattern_analysis_availability
+from council.analysis import judge_pattern_analysis_availability
 
 
 def test_reset_run_clears_previous_results(tmp_path):

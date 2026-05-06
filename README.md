@@ -11,8 +11,9 @@ If you are an agent jumping into the repo, read these in order:
 1. `README.md` for the end-to-end mental model.
 2. `AGENTS.md` for the shortest path to the code paths that matter.
 3. `prompts/` for the markdown templates that drive runs.
-4. `council/runner.py` for the generation and judging pipeline.
-5. `app.py` for the local UI and route handlers.
+4. `council/runner.py` for the top-level run lifecycle.
+5. `council/generation.py`, `council/judging.py`, and `council/leaderboard.py` for execution phases.
+6. `app.py` for the local UI and route handlers.
 
 ## Quick Start
 
@@ -43,13 +44,21 @@ Instead of tuning a judge rubric for every project, the default judge prompt com
 - Generator prompts live in `prompts/generators/`.
 - Judge prompts live in `prompts/judges/`.
 - Transcript markdown lives in `transcripts/`.
-- The SQLite schema and entity definitions live in `council/models.py`.
-- The run orchestration pipeline lives in `council/runner.py`.
-- Prompt rendering and judge parsing live in `council/judge.py`.
-- File snapshotting lives in `council/files.py`.
-- JSON repair and parsing helpers live in `council/json_tools.py`.
-- ELO and vote logic live in `council/elo.py`.
-- The local FastHTML app shell and routes live in `app.py`.
+- `app.py` is the local FastHTML shell: routes, forms, tables, and page rendering.
+- `council/models.py` defines the SQLite entities and status enums.
+- `council/runner.py` owns run creation, reset/recover/stop, and the top-level execution sequence.
+- `council/run_rows.py` creates derived generation, match, and leaderboard rows when a run is created.
+- `council/generation.py` runs generator model calls and stores outputs.
+- `council/judging.py` runs pairwise judge calls, including swapped A/B validation.
+- `council/leaderboard.py` applies and rebuilds ELO leaderboard state.
+- `council/run_state.py` contains shared run progress, pause checks, and run logging.
+- `council/jobs.py` starts local background threads for runs and judge-pattern analysis.
+- `council/analysis.py` samples judge reasoning traces and persists judge-pattern summaries.
+- `council/reports.py` contains read-only reporting queries for UI tables.
+- `council/judge.py` renders prompts and parses judge responses.
+- `council/files.py` snapshots markdown files.
+- `council/json_tools.py` repairs and parses JSON-ish model output.
+- `council/elo.py` contains pure ELO and vote reconciliation logic.
 
 ## Prompt Placeholders
 
@@ -75,11 +84,23 @@ Keep prompt files markdown-only and simple. The renderer does straight string re
 
 1. A task snapshots a task description, transcript root, and default judge prompt.
 2. A run snapshots generator prompts, judge prompts, model IDs, temperatures, and transcripts.
-3. Generation jobs produce one output per transcript per generator config.
-4. Match jobs compare generator pairs with one or more judge models.
-5. Swapped A/B votes are remapped back into the original positions.
-6. Match results update the leaderboard through ELO.
-7. Everything is stored as historical evidence so earlier runs stay explainable after files change.
+3. `council/run_rows.py` prebuilds generation rows, sampled match rows, and initial leaderboard rows.
+4. `council/jobs.py` starts a local background worker.
+5. `council/runner.py` marks the run active and coordinates generation, judging, and leaderboard phases.
+6. `council/generation.py` produces one output per transcript per generator config.
+7. `council/judging.py` compares generator pairs with one or more judge models.
+8. Swapped A/B votes are remapped back into the original positions.
+9. `council/leaderboard.py` updates ELO from completed match results.
+10. Everything is stored as historical evidence so earlier runs stay explainable after files change.
+
+## Working Boundaries
+
+- Put route handlers and HTML-rendering helpers in `app.py`.
+- Put background-thread launch mechanics in `council/jobs.py`.
+- Put model-call phases in `council/generation.py`, `council/judging.py`, or `council/analysis.py`.
+- Put read-only UI metrics in `council/reports.py`.
+- Keep `council/runner.py` as the short lifecycle coordinator rather than a home for every run detail.
+- Keep pure scoring/vote math in `council/elo.py`.
 
 ## Editing Rules
 
