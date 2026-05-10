@@ -93,6 +93,35 @@ Keep prompt files markdown-only and simple. The renderer does straight string re
 9. `council/leaderboard.py` updates ELO from completed match results.
 10. Everything is stored as historical evidence so earlier runs stay explainable after files change.
 
+## Node Graphs
+
+The newer setup path is project-scoped graphs. A graph is a local visual draft made of dataset, prompt, constant, model, and judge nodes. The graph page shows the execution plan before launch, including transcript counts, generation calls, sampled pairwise matches, and judge calls.
+
+Current graph launch support covers:
+
+- markdown-folder transcript datasets
+- CSV datasets for chained graph runs
+- in-app generator and judge prompt templates
+- `{{ socket }}` discovery after prompt save
+- reusable model nodes for generator or judge roles
+- pairwise sample percentage and run-level A/B swap validation
+- compilation into the existing run, generation, match, judgement, and ELO tables
+- graph-native chained prompt runs that pass `{{ previous_output }}` between prompt stages
+- raw-text or repaired-JSON upstream output mode on prompt nodes
+- draggable node positioning persisted on the graph
+- completed graph configs that can be forked into editable drafts
+
+Planned extensions:
+
+- SQL-backed test sets with stable call IDs
+- labelled datasets and evaluator nodes
+- BAML-backed typed parsing for structured outputs while keeping schemas simple in the UI
+- batch-job submission for models that support it
+
+## BAML Direction
+
+BAML is a good fit for the structured-output layer, not for owning the graph itself. The graph should remain the local experiment topology: datasets, prompt stages, model configs, judge configs, sampling, and visible call counts. BAML can be introduced underneath prompt nodes later to improve typed parsing and generated output formats while keeping schemas hidden behind simple UI controls.
+
 ## Working Boundaries
 
 - Put route handlers and HTML-rendering helpers in `app.py`.

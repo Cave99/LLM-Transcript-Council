@@ -20,6 +20,22 @@ def init_db() -> None:
 
     SQLModel.metadata.create_all(engine)
     with engine.begin() as connection:
+        graph_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(experimentgraph)").all()}
+        if graph_columns and "last_run_id" not in graph_columns:
+            connection.execute(text("ALTER TABLE experimentgraph ADD COLUMN last_run_id INTEGER"))
+        graph_node_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphnode)").all()}
+        if graph_node_columns and "width" not in graph_node_columns:
+            connection.execute(text("ALTER TABLE graphnode ADD COLUMN width INTEGER DEFAULT 460"))
+        if graph_node_columns and "height" not in graph_node_columns:
+            connection.execute(text("ALTER TABLE graphnode ADD COLUMN height INTEGER DEFAULT 260"))
+        graph_run_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphrun)").all()}
+        if graph_run_columns and "sample_size" not in graph_run_columns:
+            connection.execute(text("ALTER TABLE graphrun ADD COLUMN sample_size INTEGER"))
+        graph_invocation_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphinvocation)").all()}
+        if graph_invocation_columns and "duration_seconds" not in graph_invocation_columns:
+            connection.execute(text("ALTER TABLE graphinvocation ADD COLUMN duration_seconds FLOAT"))
+        if graph_invocation_columns and "output_tokens_per_second" not in graph_invocation_columns:
+            connection.execute(text("ALTER TABLE graphinvocation ADD COLUMN output_tokens_per_second FLOAT"))
         generation_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(generation)").all()}
         if "started_at" not in generation_columns:
             connection.execute(text("ALTER TABLE generation ADD COLUMN started_at DATETIME"))

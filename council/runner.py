@@ -15,8 +15,13 @@ from council.leaderboard import apply_match_elo as _apply_match_elo
 from council.leaderboard import recalculate_elo
 from council.models import (
     EloRating,
+    ExperimentGraph,
     Generation,
+    GraphEdge,
+    GraphInvocation,
     GeneratorConfig,
+    GraphNode,
+    GraphRun,
     JudgeConfig,
     Judgement,
     Match,
@@ -109,6 +114,15 @@ def delete_task(session: Session, task_id: int) -> None:
 def delete_project(session: Session, project_id: int) -> None:
     """Delete a project after recursively deleting its tasks."""
 
+    graph_ids = list(session.exec(select(ExperimentGraph.id).where(ExperimentGraph.project_id == project_id)).all())
+    for graph_id in graph_ids:
+        graph_run_ids = list(session.exec(select(GraphRun.id).where(GraphRun.graph_id == graph_id)).all())
+        for graph_run_id in graph_run_ids:
+            session.exec(delete(GraphInvocation).where(GraphInvocation.graph_run_id == graph_run_id))
+            session.exec(delete(GraphRun).where(GraphRun.id == graph_run_id))
+        session.exec(delete(GraphEdge).where(GraphEdge.graph_id == graph_id))
+        session.exec(delete(GraphNode).where(GraphNode.graph_id == graph_id))
+        session.exec(delete(ExperimentGraph).where(ExperimentGraph.id == graph_id))
     task_ids = list(session.exec(select(Task.id).where(Task.project_id == project_id)).all())
     for task_id in task_ids:
         delete_task(session, task_id)

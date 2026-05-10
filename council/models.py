@@ -34,6 +34,84 @@ class Project(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class GraphStatus(str, Enum):
+    draft = "draft"
+    running = "running"
+    complete = "complete"
+    failed = "failed"
+    paused = "paused"
+
+
+class ExperimentGraph(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="project.id")
+    name: str
+    status: GraphStatus = GraphStatus.draft
+    last_run_id: Optional[int] = Field(default=None, foreign_key="run.id")
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class GraphNode(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    graph_id: int = Field(foreign_key="experimentgraph.id")
+    kind: str
+    title: str
+    body: str = ""
+    config_json: str = "{}"
+    x: int = 0
+    y: int = 0
+    width: int = 460
+    height: int = 260
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class GraphEdge(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    graph_id: int = Field(foreign_key="experimentgraph.id")
+    from_node_id: int = Field(foreign_key="graphnode.id")
+    from_socket: str
+    to_node_id: int = Field(foreign_key="graphnode.id")
+    to_socket: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class GraphRun(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    graph_id: int = Field(foreign_key="experimentgraph.id")
+    name: str
+    status: Status = Status.pending
+    max_concurrency: int = 5
+    sample_size: Optional[int] = None
+    error: Optional[str] = None
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
+class GraphInvocation(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    graph_run_id: int = Field(foreign_key="graphrun.id")
+    node_id: int = Field(foreign_key="graphnode.id")
+    model_node_id: Optional[int] = Field(default=None, foreign_key="graphnode.id")
+    item_key: str
+    stage_index: int = 0
+    status: Status = Status.pending
+    rendered_prompt: str = ""
+    output_raw: Optional[str] = None
+    output_json: Optional[str] = None
+    error: Optional[str] = None
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    duration_seconds: Optional[float] = None
+    output_tokens_per_second: Optional[float] = None
+    cost: Optional[float] = None
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+
+
 class Task(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     project_id: int = Field(foreign_key="project.id")

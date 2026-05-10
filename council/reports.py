@@ -130,6 +130,25 @@ def judge_favorite_map(session: Session, run_id: int, judges: list[JudgeConfig])
     return favorites
 
 
+def generation_token_averages(session: Session, run_id: int) -> dict[int, str]:
+    """Return average total tokens per completed generation by config."""
+
+    rows = session.exec(
+        select(Generation, GeneratorConfig)
+        .where(Generation.run_id == run_id)
+        .where(Generation.generator_config_id == GeneratorConfig.id)
+        .where(Generation.status == Status.complete)
+    ).all()
+    by_config: dict[int, list[int]] = {}
+    for generation, config in rows:
+        total = (generation.prompt_tokens or 0) + (generation.completion_tokens or 0)
+        by_config.setdefault(config.id, []).append(total)
+    return {
+        config_id: f"{sum(tokens) // len(tokens):,}"
+        for config_id, tokens in by_config.items()
+    }
+
+
 def _format_throughput_rows(by_config: dict[int, dict]) -> list[dict[str, str]]:
     """Normalize raw timing buckets for table rendering."""
 
