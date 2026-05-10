@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlmodel import select
 
+from council.elo import update_elo
 from council.graphs import config, graph_edges, graph_nodes, prompt_inputs
 from council.judge import render_template
 from council.json_tools import maybe_repair_json
@@ -545,3 +547,112 @@ def _sync_graph_status(session, run: GraphRun) -> None:
     if graph and run.status.value in {status.value for status in GraphStatus}:
         graph.status = GraphStatus(run.status.value)
         session.add(graph)
+
+
+def graph_run_leaderboard(session, graph_run_id: int, nodes: list[GraphNode]) -> list[dict]:
+    """Compute ELO leaderboard and per-model stats from graph-native judge invocations."""
+
+    model_lookup = {node.id: node for node in nodes}
+    generator_nodes = [n for n in nodes if n.kind == "model" and config(n).get("role") == "generator"]
+    judge_nodes = [n for n in nodes if n.kind == "model" and config(n).get("role") == "judge"]
+    generator_ids = {n.id for n in generator_nodes}
+
+    invocations = session.exec(
+        select(GraphInvocation).where(GraphInvocation.graph_run_id == graph_run_id)
+    ).all()
+
+    # Token averages for generator models
+    token_totals: dict[int, list[int]] = {n.id: [] for n in generator_nodes}
+    for inv in invocations:
+        model = model_lookup.get(inv.model_node_id)
+        if model and model.id in generator_ids and inv.status == Status.complete:
+            total = (inv.prompt_tokens or 0) + (inv.completion_tokens or 0)
+            token_totals[model.id].append(total)
+
+    # Parse judge invocations to build match history
+    wins: dict[int, int] = {n.id: 0 for n in generator_nodes}
+    losses: dict[int, int] = {n.id: 0 for n in generator_nodes}
+    ties: dict[int, int] = {n.id: 0 for n in generator_nodes}
+    ratings: dict[int, float] = {n.id: 1500.0 for n in generator_nodes}
+    judge_tallies: dict[int, dict[int, int]] = {n.id: {} for n in judge_nodes}
+
+    judge_invs = [
+        inv for inv in invocations
+        if inv.status == Status.complete and inv.output_json
+        and model_lookup.get(inv.node_id)
+        and model_lookup[inv.node_id].kind == "judge"
+    ]
+
+    for inv in judge_invs:
+        judge_prompt = model_lookup[inv.node_id]
+        winner_key = config(judge_prompt).get("winner_key") or "winner"
+
+        # item_key format: "dataset-item-key:model_a_id-vs-model_b_id"
+        try:
+            _, pair = inv.item_key.rsplit(":", 1)
+            model_a_id_str, model_b_id_str = pair.split("-vs-")
+            model_a_id = int(model_a_id_str)
+            model_b_id = int(model_b_id_str)
+        except ValueError:
+            continue
+
+        if model_a_id not in generator_ids or model_b_id not in generator_ids:
+            continue
+
+        try:
+            result = json.loads(inv.output_json)
+            winner = str(result.get(winner_key, "TIE")).upper()
+        except (json.JSONDecodeError, AttributeError):
+            continue
+
+        judge_model = model_lookup.get(inv.model_node_id)
+
+        if winner == "A":
+            wins[model_a_id] += 1
+            losses[model_b_id] += 1
+            ratings[model_a_id], ratings[model_b_id] = update_elo(
+                ratings[model_a_id], ratings[model_b_id], "A"
+            )
+            if judge_model:
+                judge_tallies[judge_model.id][model_a_id] = judge_tallies[judge_model.id].get(model_a_id, 0) + 1
+        elif winner == "B":
+            wins[model_b_id] += 1
+            losses[model_a_id] += 1
+            ratings[model_a_id], ratings[model_b_id] = update_elo(
+                ratings[model_a_id], ratings[model_b_id], "B"
+            )
+            if judge_model:
+                judge_tallies[judge_model.id][model_b_id] = judge_tallies[judge_model.id].get(model_b_id, 0) + 1
+        else:
+            ties[model_a_id] += 1
+            ties[model_b_id] += 1
+            ratings[model_a_id], ratings[model_b_id] = update_elo(
+                ratings[model_a_id], ratings[model_b_id], "TIE"
+            )
+
+    # Compute judge favorites
+    favorites: dict[int, list[GraphNode]] = {n.id: [] for n in generator_nodes}
+    for judge_id, tallies in judge_tallies.items():
+        if not tallies:
+            continue
+        favorite_id = max(tallies.items(), key=lambda x: x[1])[0]
+        judge_model = model_lookup.get(judge_id)
+        if judge_model:
+            favorites[favorite_id].append(judge_model)
+
+    rows = []
+    for node in generator_nodes:
+        rows.append(
+            {
+                "node": node,
+                "rating": ratings[node.id],
+                "wins": wins[node.id],
+                "losses": losses[node.id],
+                "ties": ties[node.id],
+                "avg_tokens": f"{sum(token_totals[node.id]) // len(token_totals[node.id]):,}" if token_totals[node.id] else "-",
+                "favorites": favorites.get(node.id, []),
+            }
+        )
+
+    rows.sort(key=lambda r: r["rating"], reverse=True)
+    return rows

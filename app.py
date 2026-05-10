@@ -10,7 +10,6 @@ from fasthtml.common import *
 from sqlmodel import Session, select
 
 from council.db import engine, init_db
-from council.analysis import judge_pattern_analysis_availability
 from council.files import list_markdown_files
 from council.graphs import (
     add_constant_node,
@@ -28,7 +27,6 @@ from council.graphs import (
     fork_graph,
     graph_edges as graph_edge_rows,
     graph_nodes,
-    launch_graph_run,
     plan_graph,
     prompt_inputs,
     rename_graph,
@@ -36,44 +34,23 @@ from council.graphs import (
     update_node,
     update_node_position,
 )
-from council.graph_runtime import create_graph_native_run, graph_native_progress, stop_graph_native_run
-from council.jobs import run_thread_is_active, start_analysis_thread, start_graph_run_thread, start_run_thread
+from council.graph_runtime import (
+    create_graph_native_run,
+    graph_native_progress,
+    graph_run_leaderboard,
+    stop_graph_native_run,
+)
+from council.jobs import start_graph_run_thread
 from council.models import (
-    EloRating,
     ExperimentGraph,
-    Generation,
-    GeneratorConfig,
     GraphNode,
     GraphInvocation,
     GraphEdge,
     GraphRun,
-    JudgeConfig,
-    Judgement,
-    Match,
-    MatchResult,
     Project,
-    Run,
-    RunAnalysis,
-    RunLog,
     Status,
-    Task,
-    Transcript,
 )
-from council.reports import generation_throughput, generation_token_averages, judge_favorite_map, judgement_throughput
-from council.runner import (
-    GeneratorSpec,
-    JudgeSpec,
-    create_project,
-    create_run,
-    delete_project,
-    delete_task,
-    rename_project,
-    recover_run,
-    reset_run,
-    stop_run,
-    create_task,
-    run_progress,
-)
+from council.runner import create_project, delete_project, rename_project
 
 load_dotenv()
 init_db()
@@ -106,7 +83,6 @@ def shell(title: str, *content):
                 Nav(
                     A("Projects", href="/"),
                     A("New Graph", href="/graphs/new"),
-                    A("Runs", href="/runs"),
                 ),
                 cls="topbar",
             ),
@@ -267,7 +243,10 @@ def get():
 
     with session() as db:
         projects = db.exec(select(Project).order_by(Project.created_at.desc())).all()
-        runs = db.exec(select(Run).order_by(Run.created_at.desc()).limit(5)).all()
+        graph_runs = db.exec(
+            select(GraphRun).order_by(GraphRun.created_at.desc()).limit(5)
+        ).all()
+        graphs = {g.id: g for g in db.exec(select(ExperimentGraph)).all()}
     return shell(
         "Projects",
         Section(
@@ -277,7 +256,7 @@ def get():
                 cls="hero-copy",
             ),
             Form(
-                input_row("Project name", "name", placeholder="Call coaching evals", help_text="A project groups related tasks, runs, and results. Use one for a product area, customer workflow, or experiment family."),
+                input_row("Project name", "name", placeholder="Call coaching evals", help_text="A project groups related evaluation work. Use one for a product area, customer workflow, or experiment family."),
                 Button("Create project", type="submit"),
                 action="/projects",
                 method="post",
@@ -294,18 +273,22 @@ def get():
                         f"/projects/{project.id}",
                         f"Created {project.created_at:%Y-%m-%d %H:%M}",
                         f"/projects/{project.id}/delete",
-                        f"Delete project '{project.name}'? This will also delete its tasks and runs.",
+                        f"Delete project '{project.name}'? This will also delete its graphs and runs.",
                     )
                     for project in projects
                 ]
-                or [empty_state("No projects yet", "Create a project to group related tasks and runs.")],
+                or [empty_state("No projects yet", "Create a project to group related graphs and runs.")],
                 cls="grid",
             ),
             cls="section",
         ),
         Section(
-            H2("Recent Runs"),
-            run_table(runs),
+            H2("Recent Graph Runs"),
+            Div(
+                *[graph_run_card(run, graphs.get(run.graph_id)) for run in graph_runs]
+                or [P("No graph runs yet.", cls="muted")],
+                cls="run-history-list",
+            ),
             cls="section",
         ),
     )
@@ -361,7 +344,6 @@ def get(project_id: int):
         project = db.get(Project, project_id)
         graphs = db.exec(select(ExperimentGraph).where(ExperimentGraph.project_id == project_id).order_by(ExperimentGraph.updated_at.desc())).all()
         graphs = [sync_graph_status(db, graph) for graph in graphs]
-        tasks = db.exec(select(Task).where(Task.project_id == project_id)).all()
     return shell(
         project.name,
         Div(
@@ -383,7 +365,6 @@ def get(project_id: int):
                 ),
                 cls="hero-copy",
             ),
-            A("Create task", href=f"/tasks/new?project_id={project_id}", cls="button"),
             A("New graph", href=f"/graphs/new?project_id={project_id}", cls="button"),
             cls="page-head",
         ),
@@ -395,24 +376,6 @@ def get(project_id: int):
                     for graph in graphs
                 ]
                 or [empty_state("No graphs yet", "Create a node graph to configure prompts, models, datasets, judges, and run counts.", f"/graphs/new?project_id={project_id}", "Create graph")],
-                cls="grid",
-            ),
-            cls="section",
-        ),
-        Section(
-            H2("Legacy Tasks"),
-            Div(
-                *[
-                    list_card(
-                        task.name,
-                        f"/tasks/{task.id}",
-                        Path(task.description_path).name,
-                        f"/tasks/{task.id}/delete",
-                        f"Delete task '{task.name}'? This will also delete its runs and results.",
-                    )
-                    for task in tasks
-                ]
-                or [empty_state("No tasks yet", "Create a task before configuring evaluation runs.", f"/tasks/new?project_id={project_id}", "Create task")],
                 cls="grid",
             ),
             cls="section",
@@ -472,13 +435,13 @@ def get(graph_id: int, mode: str = "view"):
         nodes = graph_nodes(db, graph_id)
         edges = graph_edge_rows(db, graph_id)
         plan = plan_graph(db, graph_id)
-        last_run = db.get(Run, graph.last_run_id) if graph.last_run_id else None
         graph_runs = db.exec(
             select(GraphRun)
             .where(GraphRun.graph_id == graph_id)
             .order_by(GraphRun.created_at.desc())
             .limit(12)
         ).all()
+        last_graph_run = graph_runs[0] if graph_runs else None
     configure = mode == "configure"
     return shell(
         graph.name,
@@ -491,7 +454,7 @@ def get(graph_id: int, mode: str = "view"):
             Div(
                 status_pill(graph.status.value),
                 A("Project", href=f"/projects/{project.id}", cls="button subtle"),
-                A("Open run", href=f"/runs/{last_run.id}", cls="button subtle") if last_run else "",
+                A("Open run", href=f"/graph-runs/{last_graph_run.id}", cls="button subtle") if last_graph_run else "",
                 A("Configure fullscreen", href=f"/graphs/{graph.id}?mode=configure", cls="button") if not configure else A("Exit configure", href=f"/graphs/{graph.id}", cls="button subtle"),
                 cls="actions",
             ),
@@ -732,17 +695,6 @@ def post(
 
 
 @rt("/graphs/{graph_id}/launch")
-def post(graph_id: int, max_concurrency: int = 5):
-    """Compile a graph and start it as a background run."""
-
-    with session() as db:
-        run = launch_graph_run(db, graph_id, max_concurrency=max_concurrency)
-        run_id = run.id
-    start_run_thread(run_id, session)
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
-
-
-@rt("/graphs/{graph_id}/native-launch")
 def post(graph_id: int, max_concurrency: int = 5, run_mode: str = "full"):
     """Start graph-native execution over one item or the full dataset."""
 
@@ -775,6 +727,7 @@ def get(graph_run_id: int):
         plan = plan_graph(db, graph.id)
         nodes = {node.id: node for node in graph_node_list}
         node_progress = graph_node_progress(graph_node_list, invocations)
+        leaderboard = graph_run_leaderboard(db, graph_run_id, graph_node_list)
     return shell(
         graph_run.name,
             Div(
@@ -796,6 +749,29 @@ def get(graph_run_id: int):
         ),
         graph_surface(graph, graph_node_list, edges, plan, configure=False, node_progress=node_progress),
         Section(
+            H2("Leaderboard"),
+            Table(
+                Thead(Tr(Th("Model"), Th("Temp"), Th("ELO"), Th("W"), Th("L"), Th("T"), Th("Avg Tok"), Th("Judge Favs"))),
+                Tbody(
+                    *[
+                        Tr(
+                            Td(node_config(row["node"]).get("model_id", row["node"].title)),
+                            Td(str(node_config(row["node"]).get("temperature", "-"))),
+                            Td(f"{row['rating']:.1f}"),
+                            Td(str(row["wins"])),
+                            Td(str(row["losses"])),
+                            Td(str(row["ties"])),
+                            Td(row["avg_tokens"]),
+                            Td(graph_judge_favorite_badges(row["favorites"])),
+                        )
+                        for row in leaderboard
+                    ]
+                    or [Tr(Td("No completed judge votes yet.", colspan="8", cls="muted"))]
+                ),
+            ),
+            cls="section panel",
+        ),
+        Section(
             H2("Model Outputs"),
             graph_run_output_browser(invocations, nodes),
             cls="section",
@@ -812,506 +788,32 @@ def post(graph_run_id: int):
     return RedirectResponse(f"/graph-runs/{graph_run_id}", status_code=303)
 
 
-@rt("/tasks/new")
-def get(project_id: int | None = None):
-    """Render the task creation page."""
-
-    with session() as db:
-        projects = db.exec(select(Project)).all()
-    if not projects:
-        return shell(
-            "New Task",
-            Div(H1("New Task"), P("Create a project first, then attach task descriptions, judge prompts, and transcripts.", cls="muted"), cls="page-head"),
-            empty_state("No projects available", "Tasks live inside projects so previous runs stay grouped over time.", "/", "Create project"),
-        )
-    task_files = list_markdown_files("prompts/tasks")
-    judge_files = list_markdown_files("prompts/judges")
-    transcript_root = Path("transcripts").resolve()
-    return shell(
-        "New Task",
-        H1("New Task"),
-        Form(
-            Label(
-                help_label("Project", "The project keeps this task grouped with related evaluation work."),
-                Select(
-                    *[selected_option(p.id, p.name, p.id == project_id) for p in projects],
-                    name="project_id",
-                ),
-                cls="field",
-            ),
-            input_row("Task name", "name", placeholder="Cross-sell coaching feedback", help_text="A task defines the evaluation question that every run under it will test."),
-            prompt_picker("Task description", "description_path", task_files, Path("prompts/tasks/example_task.md").resolve(), help_text="Markdown instructions describing what good output should do. This content is snapshotted into the task."),
-            Label(
-                help_label("Transcript folder", "Folder of markdown transcripts. Runs generate outputs for these transcripts, or for the sample size you choose."),
-                Input(name="transcript_root", value=str(transcript_root), placeholder="/path/to/transcripts"),
-                cls="field",
-            ),
-            prompt_picker("Default judge prompt", "default_judge_prompt_path", judge_files, Path("prompts/judges/default_pairwise.md").resolve(), help_text="Default pairwise comparison prompt used when creating runs for this task."),
-            input_row("Default pairing sample %", "default_pairing_sample_pct", value="100", type="number", min="1", max="100", step="1", help_text="Percent of generator pairings to judge for each run. Use 20-30 for faster random sampling instead of full pairwise."),
-            Label(Input(type="checkbox", name="default_swap_enabled", value="true", checked=True), Span("Swap A/B positions to check judge position bias by default"), cls="check"),
-            Button("Create task", type="submit"),
-            action="/tasks",
-            method="post",
-            cls="panel form-stack",
-        ),
-    )
 
 
-@rt("/tasks")
-def post(
-    project_id: int,
-    name: str,
-    description_path: str,
-    transcript_root: str,
-    default_judge_prompt_path: str,
-    default_pairing_sample_pct: str = "100",
-    default_swap_enabled: str | None = None,
-):
-    """Create a task from the task form."""
-
-    if not name.strip():
-        return RedirectResponse(f"/tasks/new?project_id={project_id}", status_code=303)
-    with session() as db:
-        task = create_task(
-            db,
-            project_id=project_id,
-            name=name,
-            description_path=description_path,
-            transcript_root=transcript_root,
-            default_judge_prompt_path=default_judge_prompt_path,
-            default_pairing_sample_pct=float(default_pairing_sample_pct or 100),
-            default_swap_enabled=default_swap_enabled == "true",
-        )
-    return RedirectResponse(f"/tasks/{task.id}", status_code=303)
 
 
-@rt("/tasks/{task_id}/delete")
-def post(task_id: int):
-    """Delete a task and return to its parent project."""
-
-    with session() as db:
-        task = db.get(Task, task_id)
-        if not task:
-            return RedirectResponse("/", status_code=303)
-        project_id = task.project_id
-        delete_task(db, task_id)
-        db.commit()
-    return RedirectResponse(f"/projects/{project_id}", status_code=303)
 
 
-@rt("/tasks/{task_id}")
-def get(task_id: int):
-    """Render a task detail page with its runs and transcript summary."""
-
-    with session() as db:
-        task = db.get(Task, task_id)
-        runs = db.exec(select(Run).where(Run.task_id == task_id).order_by(Run.created_at.desc())).all()
-    files = list_markdown_files(task.transcript_root)
-    return shell(
-        task.name,
-        Div(
-            Div(H1(task.name), P(preview_text(task.description_snapshot), cls="muted"), cls="hero-copy"),
-            A("New run", href=f"/runs/new?task_id={task.id}", cls="button"),
-            cls="page-head",
-        ),
-        Section(
-            H2("Transcript Set"),
-            P(f"{len(files)} markdown transcript files in {task.transcript_root}", cls="muted"),
-            P(f"Default pairing sample: {task.default_pairing_sample_pct:.0f}% of generator pairings", cls="muted"),
-            P(f"A/B swap validation: {'enabled' if task.default_swap_enabled else 'disabled'} by default", cls="muted"),
-            cls="section panel",
-        ),
-        Section(H2("Runs"), run_table(runs), cls="section"),
-    )
 
 
-@rt("/runs/new")
-def get(task_id: int | None = None):
-    """Render the run creation page."""
-
-    with session() as db:
-        tasks = db.exec(select(Task)).all()
-    if not tasks:
-        return shell(
-            "New Run",
-            Div(H1("New Run"), P("Create a task first, then compare generator configurations against its transcripts.", cls="muted"), cls="page-head"),
-            empty_state("No tasks available", "Runs need a task description, transcript folder, and default judge prompt before they can start.", "/tasks/new", "Create task"),
-        )
-    task = next((t for t in tasks if t.id == task_id), tasks[0] if tasks else None)
-    default_judge = task.default_judge_prompt_path if task else str(Path("prompts/judges/default_pairwise.md").resolve())
-    default_pairing_sample_pct = task.default_pairing_sample_pct if task else 100
-    default_swap_enabled = task.default_swap_enabled if task else True
-    generator_prompt_files = list_markdown_files("prompts/generators")
-    judge_prompt_files = list_markdown_files("prompts/judges")
-    default_generator_prompt = str(Path("prompts/generators/example_prompt.md").resolve())
-    return shell(
-        "New Run",
-        H1("New Run"),
-        Form(
-            Label(
-                help_label("Task", "The task supplies transcript set, task description, and default judge prompt for this run."),
-                Select(*[selected_option(t.id, t.name, t.id == task_id) for t in tasks], name="task_id"),
-                cls="field",
-            ),
-            input_row("Run name", "name", placeholder="gpt prompt v2 comparison", help_text="A run is one experiment with fixed generator configs, judge configs, sampling settings, and snapshots."),
-            input_row("Transcript sample size", "sample_size", placeholder="leave blank for all", type="number", min="1", help_text="Limits how many transcript files are included. Leave blank to evaluate every transcript."),
-            input_row("Pairing sample %", "pairing_sample_pct", value=f"{default_pairing_sample_pct:.0f}", type="number", min="1", max="100", step="1", help_text="Percent of generator pairings to judge per transcript. 100% is full pairwise evaluation; use 20-30 for faster random sampling."),
-            input_row("Max concurrent LLM calls", "max_concurrency", value=os.getenv("MAX_CONCURRENT_LLM_CALLS", "5"), type="number", min="1", help_text="Caps simultaneous OpenRouter calls across generation and judging."),
-            H2("Generator configs"),
-            Div(
-                config_card("generator", 1, prompt_files=generator_prompt_files, defaults={"label": "baseline", "model_id": "openai/gpt-4o-mini", "temperature": "0.2", "prompt_path": default_generator_prompt}, required=True),
-                config_card("generator", 2, prompt_files=generator_prompt_files, defaults={"label": "variant", "model_id": "anthropic/claude-3.5-haiku", "temperature": "0.2", "prompt_path": default_generator_prompt}, required=True),
-                config_card("generator", 3, prompt_files=generator_prompt_files, defaults={"temperature": "0.2", "prompt_path": default_generator_prompt}),
-                config_card("generator", 4, prompt_files=generator_prompt_files, defaults={"temperature": "0.2", "prompt_path": default_generator_prompt}),
-                config_card("generator", 5, prompt_files=generator_prompt_files, defaults={"temperature": "0.2", "prompt_path": default_generator_prompt}),
-                cls="config-grid",
-            ),
-            H2("Judge configs"),
-            Div(
-                config_card("judge", 1, prompt_files=judge_prompt_files, defaults={"label": "judge-1", "model_id": "openai/gpt-4o-mini", "temperature": "0.0", "prompt_path": default_judge}, required=True),
-                config_card("judge", 2, prompt_files=judge_prompt_files, defaults={"label": "judge-2", "model_id": "anthropic/claude-3.5-haiku", "temperature": "0.0", "prompt_path": default_judge}),
-                config_card("judge", 3, prompt_files=judge_prompt_files, defaults={"label": "judge-3", "model_id": "google/gemini-flash-1.5", "temperature": "0.0", "prompt_path": default_judge}),
-                config_card("judge", 4, prompt_files=judge_prompt_files, defaults={"temperature": "0.0", "prompt_path": default_judge}),
-                config_card("judge", 5, prompt_files=judge_prompt_files, defaults={"temperature": "0.0", "prompt_path": default_judge}),
-                cls="config-grid",
-            ),
-            Label(Input(type="checkbox", name="swap_enabled", value="true", checked=default_swap_enabled), Span("Validate each judge vote with swapped A/B positions"), cls="check"),
-            Button("Create and start run", type="submit"),
-            action="/runs",
-            method="post",
-            cls="panel form-stack",
-        ),
-    )
 
 
-@rt("/runs")
-def post(
-    task_id: int,
-    name: str,
-    sample_size: str = "",
-    pairing_sample_pct: str = "100",
-    max_concurrency: int = 5,
-    swap_enabled: str | None = None,
-    generator_1_label: str = "",
-    generator_1_model_id: str = "",
-    generator_1_temperature: str = "0.2",
-    generator_1_prompt_path: str = "",
-    generator_2_label: str = "",
-    generator_2_model_id: str = "",
-    generator_2_temperature: str = "0.2",
-    generator_2_prompt_path: str = "",
-    generator_3_label: str = "",
-    generator_3_model_id: str = "",
-    generator_3_temperature: str = "0.2",
-    generator_3_prompt_path: str = "",
-    generator_4_label: str = "",
-    generator_4_model_id: str = "",
-    generator_4_temperature: str = "0.2",
-    generator_4_prompt_path: str = "",
-    generator_5_label: str = "",
-    generator_5_model_id: str = "",
-    generator_5_temperature: str = "0.2",
-    generator_5_prompt_path: str = "",
-    judge_1_label: str = "",
-    judge_1_model_id: str = "",
-    judge_1_temperature: str = "0.0",
-    judge_1_prompt_path: str = "",
-    judge_2_label: str = "",
-    judge_2_model_id: str = "",
-    judge_2_temperature: str = "0.0",
-    judge_2_prompt_path: str = "",
-    judge_3_label: str = "",
-    judge_3_model_id: str = "",
-    judge_3_temperature: str = "0.0",
-    judge_3_prompt_path: str = "",
-    judge_4_label: str = "",
-    judge_4_model_id: str = "",
-    judge_4_temperature: str = "0.0",
-    judge_4_prompt_path: str = "",
-    judge_5_label: str = "",
-    judge_5_model_id: str = "",
-    judge_5_temperature: str = "0.0",
-    judge_5_prompt_path: str = "",
-):
-    """Create a run and immediately start execution in the background."""
-
-    generators = build_generator_specs(
-        [
-            (generator_1_label, generator_1_model_id, generator_1_temperature, generator_1_prompt_path),
-            (generator_2_label, generator_2_model_id, generator_2_temperature, generator_2_prompt_path),
-            (generator_3_label, generator_3_model_id, generator_3_temperature, generator_3_prompt_path),
-            (generator_4_label, generator_4_model_id, generator_4_temperature, generator_4_prompt_path),
-            (generator_5_label, generator_5_model_id, generator_5_temperature, generator_5_prompt_path),
-        ]
-    )
-    judges = build_judge_specs(
-        [
-            (judge_1_label, judge_1_model_id, judge_1_temperature, judge_1_prompt_path),
-            (judge_2_label, judge_2_model_id, judge_2_temperature, judge_2_prompt_path),
-            (judge_3_label, judge_3_model_id, judge_3_temperature, judge_3_prompt_path),
-            (judge_4_label, judge_4_model_id, judge_4_temperature, judge_4_prompt_path),
-            (judge_5_label, judge_5_model_id, judge_5_temperature, judge_5_prompt_path),
-        ]
-    )
-    with session() as db:
-        run = create_run(
-            db,
-            task_id=task_id,
-            name=name,
-            generator_specs=generators,
-            judge_specs=judges,
-            sample_size=int(sample_size) if sample_size else None,
-            pairing_sample_pct=float(pairing_sample_pct or 100),
-            max_concurrency=max_concurrency,
-            swap_enabled=swap_enabled == "true",
-        )
-        run_id = run.id
-    start_run_thread(run_id, session)
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
-@rt("/runs")
-def get():
-    """Render the global runs index."""
-
-    with session() as db:
-        runs = db.exec(select(Run).order_by(Run.created_at.desc())).all()
-    return shell("Runs", Div(H1("Runs"), A("New run", href="/runs/new", cls="button"), cls="page-head"), run_table(runs))
 
 
-@rt("/runs/{run_id}")
-def get(run_id: int):
-    """Render one run with progress, leaderboard, logs, and matches."""
-
-    with session() as db:
-        run = db.get(Run, run_id)
-        task = db.get(Task, run.task_id)
-        progress = run_progress(db, run_id)
-        leaderboard = db.exec(
-            select(EloRating, GeneratorConfig)
-            .where(EloRating.run_id == run_id)
-            .where(EloRating.generator_config_id == GeneratorConfig.id)
-            .order_by(EloRating.rating.desc())
-        ).all()
-        matches = db.exec(select(Match).where(Match.run_id == run_id).limit(20)).all()
-        logs = db.exec(select(RunLog).where(RunLog.run_id == run_id).order_by(RunLog.created_at.desc()).limit(40)).all()
-        generator_configs = db.exec(select(GeneratorConfig).where(GeneratorConfig.run_id == run_id)).all()
-        judge_configs = db.exec(select(JudgeConfig).where(JudgeConfig.run_id == run_id)).all()
-        judge_favorites = judge_favorite_map(db, run_id, judge_configs)
-        analyses = db.exec(select(RunAnalysis).where(RunAnalysis.run_id == run_id).order_by(RunAnalysis.created_at.desc())).all()
-        throughput = generation_throughput(db, run_id)
-        judge_throughput = judgement_throughput(db, run_id)
-        token_averages = generation_token_averages(db, run_id)
-        analysis_allowed, analysis_help = judge_pattern_analysis_availability(run, progress["judgements"])
-    return shell(
-        run.name,
-        Div(
-            Div(H1(run.name), P(task.name, cls="muted"), cls="hero-copy"),
-            Div(
-                status_pill(run.status.value),
-                run_action_button(run, "Recover Run", f"/runs/{run.id}/recover") if run.status != Status.running else "",
-                run_action_button(run, "Run / Re-run", f"/runs/{run.id}/rerun") if run.status != Status.running else "",
-                run_action_button(run, "Stop Run", f"/runs/{run.id}/stop", subtle=True) if run.status == Status.running else "",
-                A("Refresh", href=f"/runs/{run.id}", cls="button subtle"),
-                cls="actions",
-            ),
-            cls="page-head",
-        ),
-        Section(
-            H2("Progress"),
-            P(run.error, cls="error") if run.error else "",
-            P(f"Pairing sample: {run.pairing_sample_pct:.0f}% of generator pairings per transcript", cls="muted"),
-            progress_meter("Generations", progress["generations_complete"], progress["generations"]),
-            progress_breakdown(
-                pending=progress["generations_pending"],
-                running=progress["generations_running"],
-                failed=progress["generations_failed"],
-            ),
-            progress_meter("Matches", progress["matches_complete"], progress["matches"]),
-            progress_breakdown(
-                pending=progress["matches_pending"],
-                running=progress["matches_running"],
-                failed=progress["matches_failed"],
-            ),
-            P(f'{progress["judgements"]} judge calls recorded', cls="muted"),
-            cls="section panel",
-        ),
-        Details(
-            Summary("Run Console"),
-            run_console(logs),
-            data_details_key="run-console",
-            cls="section panel",
-        ),
-        Section(
-            H2("Generation Throughput"),
-            throughput_table(throughput),
-            P("TPS uses completed generation calls with recorded token counts and start/end times.", cls="muted"),
-            cls="section panel",
-        ),
-        Section(
-            H2("Judge Throughput"),
-            throughput_table(judge_throughput),
-            P("Judge TPS uses completed judge calls with recorded token counts and start/end times.", cls="muted"),
-            cls="section panel",
-        ),
-        Section(
-            H2("Leaderboard"),
-            analysis_action_button(run, f"/runs/{run.id}/judge-pattern-analysis")
-            if analysis_allowed
-            else P(analysis_help, cls="muted"),
-            Table(
-                Thead(Tr(Th("Config"), Th("Model"), Th("Temp"), Th("ELO"), Th("W"), Th("L"), Th("T"), Th("Avg Tok"), Th("Judge Favs"))),
-                Tbody(
-                    *[
-                        Tr(
-                            Td(config.label),
-                            Td(config.model_id),
-                            Td(str(config.temperature)),
-                            Td(f"{rating.rating:.1f}"),
-                            Td(str(rating.wins)),
-                            Td(str(rating.losses)),
-                            Td(str(rating.ties)),
-                            Td(token_averages.get(config.id, "-")),
-                            Td(judge_favorite_badges(config.id, judge_favorites)),
-                        )
-                        for rating, config in leaderboard
-                    ]
-                ),
-            ),
-            P(f"Judged by {', '.join(judge.model_id for judge in judge_configs)}", cls="judged-by"),
-            analysis_history(analyses),
-            cls="section panel",
-        ),
-        Section(
-            H2("Prompt Snapshots"),
-            Div(
-                prompt_snapshot_group("Generator Prompts", generator_configs),
-                prompt_snapshot_group("Judge Prompts", judge_configs),
-                cls="prompt-inspector",
-            ),
-            cls="section panel",
-        ),
-        Section(
-            H2("Recent Matches"),
-            Table(
-                Thead(Tr(Th("Transcript"), Th("Matchup"), Th("Winner"), Th("Agreement"), Th("Votes"), Th("Status"), Th(""))),
-                Tbody(
-                    *[match_row(match.id) for match in matches]
-                    or [Tr(Td("No matches yet.", colspan="7", cls="muted"))]
-                ),
-                cls="match-table",
-            ),
-            cls="section panel",
-        ),
-    )
 
 
-@rt("/runs/{run_id}/rerun")
-def post(run_id: int):
-    """Reset and rerun a completed or failed run."""
-
-    if run_thread_is_active(run_id):
-        return RedirectResponse(f"/runs/{run_id}", status_code=303)
-    with session() as db:
-        reset_run(db, run_id)
-    start_run_thread(run_id, session)
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
-@rt("/runs/{run_id}/recover")
-def post(run_id: int):
-    """Recover a paused or failed run without deleting completed outputs."""
-
-    if run_thread_is_active(run_id):
-        return RedirectResponse(f"/runs/{run_id}", status_code=303)
-    with session() as db:
-        recover_run(db, run_id)
-    start_run_thread(run_id, session)
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
-@rt("/runs/{run_id}/stop")
-def post(run_id: int):
-    """Pause a running run."""
-
-    with session() as db:
-        stop_run(db, run_id)
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
-@rt("/runs/{run_id}/judge-pattern-analysis")
-def post(run_id: int):
-    """Queue a judge-pattern analysis summary for a run."""
-
-    start_analysis_thread(run_id, session)
-    return RedirectResponse(f"/runs/{run_id}", status_code=303)
 
 
-@rt("/matches/{match_id}")
-def get(match_id: int):
-    """Render a single match detail page."""
-
-    with session() as db:
-        match = db.get(Match, match_id)
-        transcript = db.get(Transcript, match.transcript_id)
-        gen_a = db.get(Generation, match.generation_a_id)
-        gen_b = db.get(Generation, match.generation_b_id)
-        cfg_a = db.get(GeneratorConfig, match.config_a_id)
-        cfg_b = db.get(GeneratorConfig, match.config_b_id)
-        result = db.exec(select(MatchResult).where(MatchResult.match_id == match_id)).first()
-        judgements = db.exec(select(Judgement).where(Judgement.match_id == match_id)).all()
-    return shell(
-        f"Match {match_id}",
-        H1(f"Match {match_id}"),
-        Section(
-            H2("Result"),
-            P(result.final_winner if result else "Pending", cls="big-result"),
-            P(f"Agreement: {result.agreement:.0%}" if result else "", cls="muted"),
-            cls="section panel",
-        ),
-        Section(H2("Transcript"), Pre(transcript.content_snapshot), cls="section panel"),
-        Div(
-            Section(H2(f"Output A: {cfg_a.label}"), Pre(gen_a.output_repaired or gen_a.output_raw or ""), cls="panel"),
-            Section(H2(f"Output B: {cfg_b.label}"), Pre(gen_b.output_repaired or gen_b.output_raw or ""), cls="panel"),
-            cls="two-col",
-        ),
-        Section(
-            H2("Judge Reasoning"),
-            Div(
-                *[
-                    Div(
-                        H3(f"{j.direction}: {j.winner}"),
-                        P(j.reasoning),
-                        cls="list-card",
-                    )
-                    for j in judgements
-                ],
-                cls="stack",
-            ),
-            cls="section",
-        ),
-    )
 
 
-def run_table(runs):
-    """Render a compact table of runs."""
-
-    return Table(
-        Thead(Tr(Th("Run"), Th("Status"), Th("Created"), Th(""))),
-        Tbody(
-            *[
-                Tr(
-                    Td(run.name),
-                    Td(status_pill(run.status.value)),
-                    Td(f"{run.created_at:%Y-%m-%d %H:%M}"),
-                    Td(A("Open", href=f"/runs/{run.id}")),
-                )
-                for run in runs
-            ]
-            or [Tr(Td("No runs yet.", colspan="4", cls="muted"))]
-        ),
-        cls="run-table",
-    )
 
 
 def graph_card(graph: ExperimentGraph):
@@ -1955,7 +1457,7 @@ def progress_breakdown(*, pending: int, running: int, failed: int):
     )
 
 
-def run_action_button(run: Run, label: str, action: str, *, subtle: bool = False):
+def run_action_button(run: GraphRun, label: str, action: str, *, subtle: bool = False):
     """Render a one-click action form for run controls."""
 
     return Form(
@@ -1966,162 +1468,38 @@ def run_action_button(run: Run, label: str, action: str, *, subtle: bool = False
     )
 
 
-def analysis_action_button(run: Run, action: str):
-    """Render the judge-pattern analysis form."""
+def graph_judge_favorite_badges(favorites: list[GraphNode]):
+    """Render badges that show which judge models favored a generator model."""
 
-    return Form(
-        Button("Judge Pattern Analysis", type="submit"),
-        Span("", cls="analysis-progress", aria_live="polite"),
-        action=action,
-        method="post",
-        cls="inline-form analysis-form",
-        data_analysis_form="true",
-    )
-
-
-def run_console(logs):
-    """Render the run event log."""
-
-    return Div(
-        *[
-            Div(
-                Span(f"{log.created_at:%H:%M:%S} ", cls="log-time"),
-                Span(log.message),
-                cls=f"run-log run-log-{log.level}",
-            )
-            for log in logs
-        ]
-        or [P("No run events yet.", cls="muted")],
-        cls="run-console",
-    )
-
-
-def throughput_table(rows: list[dict[str, str]]):
-    """Render throughput metrics in a table."""
-
-    return Table(
-        Thead(Tr(Th("Config"), Th("Model"), Th("Calls"), Th("Avg TPS"), Th("Latest TPS"), Th("Avg Latency"), Th("Output Tok"), Th("Total Tok"))),
-        Tbody(
-            *[
-                Tr(
-                    Td(row["label"]),
-                    Td(row["model"]),
-                    Td(row["calls"]),
-                    Td(row["avg_tps"]),
-                    Td(row["recent_tps"]),
-                    Td(row["avg_latency"]),
-                    Td(row["output_tokens"]),
-                    Td(row["total_tokens"]),
-                )
-                for row in rows
-            ]
-            or [Tr(Td("No timed generation completions yet.", colspan="8", cls="muted"))]
-        ),
-        cls="throughput-table",
-    )
-
-
-def judge_favorite_badges(config_id: int | None, favorites: dict[int, list[tuple[JudgeConfig, int]]]):
-    """Render badges that show which judges favored a config."""
-
-    if config_id is None:
-        return Span("None yet", cls="muted")
-    badges = favorites.get(config_id, [])
-    if not badges:
+    if not favorites:
         return Span("None yet", cls="muted")
     return Span(
         *[
             Span(
-                judge.model_id,
-                title=f"Favored in {wins} matches",
+                node_config(judge).get("model_id", judge.title),
+                title="Favored this model",
                 cls="judge-fav",
             )
-            for judge, wins in badges
+            for judge in favorites
         ],
         cls="judge-favs",
     )
 
 
-def analysis_history(analyses: list[RunAnalysis]):
-    """Render past judge-pattern analysis summaries."""
-
-    return Div(
-        *[
-            Div(
-                Div(
-                    Span(f"{analysis.created_at:%Y-%m-%d %H:%M}"),
-                    Span(f"{analysis.model_id} · {analysis.sample_size} traces"),
-                    cls="analysis-meta",
-                ),
-                P(analysis.summary),
-                cls="analysis-card",
-            )
-            for analysis in analyses
-        ],
-        cls="analysis-history",
-    ) if analyses else P("No judge pattern analysis yet.", cls="muted")
 
 
-def prompt_snapshot_group(title: str, configs):
-    """Render a collapsible prompt snapshot section."""
-
-    group_key = title.lower().replace(" ", "-")
-    return Details(
-        Summary(title),
-        Div(
-            *[
-                Details(
-                    Summary(f"{config.label} - {config.model_id}"),
-                    Div(
-                        Div(
-                            Span(f"Temp {config.temperature}"),
-                            Span(path_label(config.prompt_path)),
-                            cls="prompt-meta",
-                        ),
-                        Pre(config.prompt_snapshot),
-                        cls="prompt-body",
-                    ),
-                    cls="prompt-card",
-                    data_details_key=f"prompt-{group_key}-{config.id}",
-                )
-                for config in configs
-            ],
-            cls="prompt-stack",
-        ),
-        cls="prompt-group",
-        data_details_key=f"prompt-{group_key}",
-    )
 
 
-def match_row(match_id: int):
-    """Render one row in the recent matches table."""
-
-    with session() as db:
-        match = db.get(Match, match_id)
-        transcript = db.get(Transcript, match.transcript_id)
-        cfg_a = db.get(GeneratorConfig, match.config_a_id)
-        cfg_b = db.get(GeneratorConfig, match.config_b_id)
-        result = db.exec(select(MatchResult).where(MatchResult.match_id == match_id)).first()
-    winner = match_winner_label(result.final_winner, cfg_a, cfg_b) if result else "Pending"
-    return Tr(
-        Td(Path(transcript.path).name),
-        Td(Span(cfg_a.label, cls="match-model"), Span(" vs ", cls="muted"), Span(cfg_b.label, cls="match-model")),
-        Td(Span(winner, cls=f"result-chip result-{(result.final_winner if result else match.status.value).lower()}")),
-        Td(f"{result.agreement:.0%}" if result else "-"),
-        Td(vote_summary(result.votes_json) if result else "-"),
-        Td(status_pill(match.status.value)),
-        Td(A("Inspect", href=f"/matches/{match_id}", cls="table-link")),
-    )
 
 
-def match_winner_label(winner: str, cfg_a: GeneratorConfig, cfg_b: GeneratorConfig) -> str:
-    """Map match winners back to the generator label that won."""
 
-    if winner == "A":
-        return cfg_a.label
-    if winner == "B":
-        return cfg_b.label
-    return "Tie"
+
+
+
+
+
+
+
 
 
 def vote_summary(votes_json: str) -> str:
@@ -2132,32 +1510,6 @@ def vote_summary(votes_json: str) -> str:
     except Exception:
         return "-"
     return " / ".join(f"{label}:{votes.count(label)}" for label in ("A", "B", "TIE") if votes.count(label))
-
-
-def build_generator_specs(rows: list[tuple[str, str, str, str]]) -> list[GeneratorSpec]:
-    """Convert form rows into generator specs and skip blank entries."""
-
-    specs = []
-    for label, model_id, temperature, prompt_path in rows:
-        if not label.strip() and not model_id.strip():
-            continue
-        if not label.strip() or not model_id.strip() or not prompt_path.strip():
-            continue
-        specs.append(GeneratorSpec(label.strip(), model_id.strip(), float(temperature or 0.0), prompt_path.strip()))
-    return specs
-
-
-def build_judge_specs(rows: list[tuple[str, str, str, str]]) -> list[JudgeSpec]:
-    """Convert form rows into judge specs and skip blank entries."""
-
-    specs = []
-    for label, model_id, temperature, prompt_path in rows:
-        if not label.strip() and not model_id.strip():
-            continue
-        if not label.strip() or not model_id.strip() or not prompt_path.strip():
-            continue
-        specs.append(JudgeSpec(label.strip(), model_id.strip(), float(temperature or 0.0), prompt_path.strip()))
-    return specs
 
 
 if __name__ == "__main__":
