@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from html import escape
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -38,13 +40,15 @@ from council.graph_runtime import (
     create_graph_native_run,
     graph_native_progress,
     graph_run_leaderboard,
+    graph_run_leaderboards,
     stop_graph_native_run,
 )
-from council.jobs import start_graph_run_thread
+from council.jobs import start_graph_analysis_thread, start_graph_run_thread
 from council.models import (
     ExperimentGraph,
     GraphNode,
     GraphInvocation,
+    GraphRunAnalysis,
     GraphEdge,
     GraphRun,
     Project,
@@ -222,13 +226,14 @@ def list_card(title: str, href: str, meta: str, delete_action: str, confirm_mess
     )
 
 
-def graph_run_card(run: GraphRun):
+def graph_run_card(run: GraphRun, graph: ExperimentGraph | None = None):
     """Render a previous graph run entry."""
 
     run_kind = "test run" if run.sample_size == 1 else "full run"
     if run.status != Status.complete:
         run_kind = f"incomplete {run_kind}"
-    meta = f"{run_kind} · {run.created_at:%Y-%m-%d %H:%M}"
+    graph_label = f"{graph.name} · " if graph else ""
+    meta = f"{graph_label}{run_kind} · {run.created_at:%Y-%m-%d %H:%M}"
     return A(
         Div(H3(run.name), P(meta, cls="muted"), cls="run-history-copy"),
         status_pill(run.status.value),
@@ -695,6 +700,7 @@ def post(
 
 
 @rt("/graphs/{graph_id}/launch")
+@rt("/graphs/{graph_id}/native-launch")
 def post(graph_id: int, max_concurrency: int = 5, run_mode: str = "full"):
     """Start graph-native execution over one item or the full dataset."""
 
@@ -706,7 +712,7 @@ def post(graph_id: int, max_concurrency: int = 5, run_mode: str = "full"):
 
 
 @rt("/graph-runs/{graph_run_id}")
-def get(graph_run_id: int):
+def get(graph_run_id: int, leaderboard_view: str = "aggregate"):
     """Render graph-native run progress and outputs."""
 
     with session() as db:
@@ -727,7 +733,14 @@ def get(graph_run_id: int):
         plan = plan_graph(db, graph.id)
         nodes = {node.id: node for node in graph_node_list}
         node_progress = graph_node_progress(graph_node_list, invocations)
-        leaderboard = graph_run_leaderboard(db, graph_run_id, graph_node_list)
+        leaderboard_view = "chain" if leaderboard_view == "chain" else "aggregate"
+        leaderboard_groups = graph_run_leaderboards(db, graph_run_id, graph_node_list, view_mode=leaderboard_view)
+        leaderboard = leaderboard_groups[0]["rows"] if leaderboard_groups else []
+        analyses = db.exec(
+            select(GraphRunAnalysis)
+            .where(GraphRunAnalysis.graph_run_id == graph_run_id)
+            .order_by(GraphRunAnalysis.created_at.desc())
+        ).all()
     return shell(
         graph_run.name,
             Div(
@@ -750,25 +763,11 @@ def get(graph_run_id: int):
         graph_surface(graph, graph_node_list, edges, plan, configure=False, node_progress=node_progress),
         Section(
             H2("Leaderboard"),
-            Table(
-                Thead(Tr(Th("Model"), Th("Temp"), Th("ELO"), Th("W"), Th("L"), Th("T"), Th("Avg Tok"), Th("Judge Favs"))),
-                Tbody(
-                    *[
-                        Tr(
-                            Td(node_config(row["node"]).get("model_id", row["node"].title)),
-                            Td(str(node_config(row["node"]).get("temperature", "-"))),
-                            Td(f"{row['rating']:.1f}"),
-                            Td(str(row["wins"])),
-                            Td(str(row["losses"])),
-                            Td(str(row["ties"])),
-                            Td(row["avg_tokens"]),
-                            Td(graph_judge_favorite_badges(row["favorites"])),
-                        )
-                        for row in leaderboard
-                    ]
-                    or [Tr(Td("No completed judge votes yet.", colspan="8", cls="muted"))]
-                ),
-            ),
+            leaderboard_view_controls(graph_run_id, leaderboard_view),
+            *[
+                graph_leaderboard_table(graph_run, group, leaderboard_view, analyses)
+                for group in leaderboard_display_groups(leaderboard_groups)
+            ],
             cls="section panel",
         ),
         Section(
@@ -786,6 +785,22 @@ def post(graph_run_id: int):
     with session() as db:
         stop_graph_native_run(db, graph_run_id)
     return RedirectResponse(f"/graph-runs/{graph_run_id}", status_code=303)
+
+
+@rt("/graph-runs/{graph_run_id}/judge-summary")
+def post(graph_run_id: int, judge_prompt_node_id: str = "", leaderboard_view: str = "aggregate", top_entity_key: str = ""):
+    """Start a background judge-summary job for a graph run."""
+
+    parsed_judge_prompt_id = int(judge_prompt_node_id) if str(judge_prompt_node_id).strip() else None
+    start_graph_analysis_thread(
+        graph_run_id,
+        session,
+        judge_prompt_node_id=parsed_judge_prompt_id,
+        leaderboard_view=leaderboard_view,
+        top_entity_key=top_entity_key,
+    )
+    view = "chain" if leaderboard_view == "chain" else "aggregate"
+    return RedirectResponse(f"/graph-runs/{graph_run_id}?leaderboard_view={view}", status_code=303)
 
 
 
@@ -1244,7 +1259,7 @@ def node_config_fields(node: GraphNode, cfg: dict):
                     name="cfg_upstream_mode",
                 ),
                 cls="field",
-            )
+            ),
         ]
     if node.kind == "constant":
         return [input_row("Output name", "cfg_socket", value=cfg.get("socket", node.title.lower().replace(" ", "_")), help_text="Name of the value this node exposes to prompt inputs.")]
@@ -1318,7 +1333,7 @@ def graph_invocation_card(invocation: GraphInvocation, nodes: dict[int, GraphNod
             Pre(output),
             cls="prompt-body",
         ),
-        cls="panel",
+        cls="output-invocation",
         data_details_key=f"graph-invocation-{invocation.id}",
     )
 
@@ -1484,6 +1499,158 @@ def graph_judge_favorite_badges(favorites: list[GraphNode]):
         ],
         cls="judge-favs",
     )
+
+
+def leaderboard_view_controls(graph_run_id: int, view_mode: str):
+    """Render quick leaderboard aggregation toggles for completed graph output."""
+
+    return Div(
+        A(
+            "Aggregated for step",
+            href=f"/graph-runs/{graph_run_id}?leaderboard_view=aggregate",
+            cls="button subtle is-active" if view_mode == "aggregate" else "button subtle",
+        ),
+        A(
+            "Show chain",
+            href=f"/graph-runs/{graph_run_id}?leaderboard_view=chain",
+            cls="button subtle is-active" if view_mode == "chain" else "button subtle",
+        ),
+        cls="leaderboard-view-toggle",
+    )
+
+
+def leaderboard_display_groups(groups: list[dict]) -> list[dict]:
+    """Show judge-round leaderboards without duplicating the aggregate board."""
+
+    scoped = [group for group in groups if group["title"] != "Overall"]
+    return scoped or groups
+
+
+def graph_leaderboard_table(graph_run: GraphRun, group: dict, leaderboard_view: str, analyses: list[GraphRunAnalysis]):
+    """Render one aggregate or judge-prompt-specific leaderboard."""
+
+    title = group["title"]
+    rows = group["rows"]
+    top_row = rows[0] if rows else None
+    panel_key = f"leaderboard-{group.get('judge_prompt_node_id') or 'overall'}-{leaderboard_view}"
+    group_analyses = [
+        analysis for analysis in analyses
+        if analysis.judge_prompt_node_id == group.get("judge_prompt_node_id")
+        and (analysis.leaderboard_view or "aggregate") == leaderboard_view
+    ]
+    return Div(
+        Div(
+            H3(title) if title != "Overall" else H3("Leaderboard"),
+            Form(
+                Button("Summarize Top Model", type="submit", disabled=not top_row),
+                Span("", cls="analysis-progress"),
+                Input(type="hidden", name="judge_prompt_node_id", value=str(group.get("judge_prompt_node_id") or "")),
+                Input(type="hidden", name="leaderboard_view", value=leaderboard_view),
+                Input(type="hidden", name="top_entity_key", value=top_row.get("entity_key", "") if top_row else ""),
+                action=f"/graph-runs/{graph_run.id}/judge-summary",
+                method="post",
+                cls="analysis-form leaderboard-analysis-form",
+                data_analysis_form="true",
+            ),
+            cls="leaderboard-title-row",
+        ),
+        Table(
+            Thead(Tr(Th("Model"), Th("Temp · Reason"), Th("ELO"), Th("W"), Th("L"), Th("T"), Th("Avg Tok"), Th("Judge Favs"))),
+            Tbody(
+                *[
+                    Tr(
+                        Td(row.get("label") or (row["node"].title if row.get("node") else row.get("entity_key", "-")), title=node_config(row["node"]).get("model_id", "") if row.get("node") else ""),
+                        Td(_leaderboard_temp_reasoning(row["node"]) if row.get("node") else "-"),
+                        Td(f"{row['rating']:.1f}"),
+                        Td(str(row["wins"])),
+                        Td(str(row["losses"])),
+                        Td(str(row["ties"])),
+                        Td(row["avg_tokens"]),
+                        Td(graph_judge_favorite_badges(row["favorites"])),
+                    )
+                    for row in rows
+                ]
+                or [Tr(Td("No completed judge votes yet.", colspan="8", cls="muted"))]
+            ),
+        ),
+        Div(
+            *[graph_run_analysis_card(analysis) for analysis in group_analyses],
+            cls="analysis-history",
+        ),
+        cls="leaderboard-group",
+        data_analysis_panel="true",
+        data_analysis_key=panel_key,
+    )
+
+
+def graph_run_analysis_card(analysis: GraphRunAnalysis):
+    """Render one saved graph-run judge summary."""
+
+    return Div(
+        markdown_summary(analysis.summary),
+        Div(
+            Span(analysis.model_id),
+            Span(f"{analysis.win_sample_size} win traces"),
+            Span(f"{analysis.loss_sample_size} loss traces"),
+            Span(f"{analysis.created_at:%Y-%m-%d %H:%M}"),
+            cls="analysis-meta",
+        ),
+        cls="analysis-card",
+    )
+
+
+def markdown_summary(text: str):
+    """Render a small safe Markdown subset for model-generated summaries."""
+
+    blocks = []
+    pending_paragraph: list[str] = []
+    pending_items: list[str] = []
+
+    def flush_paragraph() -> None:
+        if pending_paragraph:
+            blocks.append(P(NotStr(_render_inline_markdown(" ".join(pending_paragraph)))))
+            pending_paragraph.clear()
+
+    def flush_items() -> None:
+        if pending_items:
+            blocks.append(Ul(*[Li(NotStr(_render_inline_markdown(item))) for item in pending_items]))
+            pending_items.clear()
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_paragraph()
+            flush_items()
+            continue
+        match = re.match(r"^[-*]\s+(.+)$", line)
+        if match:
+            flush_paragraph()
+            pending_items.append(match.group(1))
+        else:
+            flush_items()
+            pending_paragraph.append(line)
+    flush_paragraph()
+    flush_items()
+    return Div(*(blocks or [P("")]), cls="markdown-summary")
+
+
+def _render_inline_markdown(text: str) -> str:
+    escaped = escape(text)
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    return escaped
+
+
+def _leaderboard_temp_reasoning(node: GraphNode) -> str:
+    """Return 'temp · reasoning' label for leaderboard rows."""
+
+    cfg = node_config(node)
+    temp = cfg.get("temperature")
+    temp_str = str(temp) if temp is not None else "-"
+    if cfg.get("reasoning_supported"):
+        effort = cfg.get("reasoning_effort") or "default"
+        return f"{temp_str} · {effort}"
+    return f"{temp_str} · none"
 
 
 

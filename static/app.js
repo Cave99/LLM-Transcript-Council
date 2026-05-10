@@ -112,12 +112,16 @@ setInterval(() => {
 
 function bindAnalysisForms() {
   document.querySelectorAll("[data-analysis-form='true']").forEach((form) => {
+    if (form.dataset.analysisBound === "true") return;
+    form.dataset.analysisBound = "true";
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       saveDetailsState();
 
       const button = form.querySelector("button");
       const progress = form.querySelector(".analysis-progress");
+      const panel = form.closest("[data-analysis-panel='true']");
+      const initialCardCount = panel ? panel.querySelectorAll(".analysis-card").length : 0;
       const messages = [
         "Sampling judge reasoning traces...",
         "Asking analyzer model for patterns...",
@@ -137,10 +141,9 @@ function bindAnalysisForms() {
       }, 2500);
 
       try {
-        const response = await fetch(form.action, { method: "POST" });
+        await fetch(form.action, { method: "POST", body: new FormData(form) });
+        await pollAnalysisResult(panel, initialCardCount);
         clearInterval(timer);
-        progress.textContent = "Analysis saved. Refreshing...";
-        window.location.href = response.url || window.location.href;
       } catch (error) {
         clearInterval(timer);
         button.disabled = false;
@@ -149,6 +152,47 @@ function bindAnalysisForms() {
       }
     });
   });
+}
+
+async function pollAnalysisResult(panel, initialCardCount) {
+  if (!panel) return;
+
+  const panelKey = panel.dataset.analysisKey;
+  const maxAttempts = 80;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, attempt === 0 ? 1000 : 3000));
+    const response = await fetch(window.location.href, {
+      method: "GET",
+      headers: { "Cache-Control": "no-store" },
+    });
+    const html = await response.text();
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const selector = panelKey
+      ? `[data-analysis-panel='true'][data-analysis-key="${CSS.escape(panelKey)}"]`
+      : "[data-analysis-panel='true']";
+    const nextPanel = doc.querySelector(selector);
+    if (!nextPanel) continue;
+
+    const nextCardCount = nextPanel.querySelectorAll(".analysis-card").length;
+    if (nextCardCount > initialCardCount) {
+      panel.replaceWith(nextPanel);
+      bindAnalysisForms();
+      return;
+    }
+
+    const progress = panel.querySelector(".analysis-progress");
+    if (progress && attempt > 0) {
+      progress.textContent = "Still waiting for the summary...";
+    }
+  }
+
+  const button = panel.querySelector("button");
+  const progress = panel.querySelector(".analysis-progress");
+  if (button) {
+    button.disabled = false;
+    button.textContent = button.dataset.originalText || "Summarize Top Model";
+  }
+  if (progress) progress.textContent = "Still running. Refresh later to see the summary.";
 }
 
 function getCanvasZoom(canvas) {

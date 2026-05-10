@@ -49,6 +49,17 @@ class RuntimeEdge:
     to_socket: str
 
 
+@dataclass(frozen=True)
+class OutputBranch:
+    """One item-scoped output branch flowing between prompt stages."""
+
+    item: DatasetItem
+    chain: tuple[int, ...]
+    output: str
+    prompt_id: int | None = None
+    stage_index: int = -1
+
+
 def create_graph_native_run(session, graph_id: int, *, max_concurrency: int = 5, sample_size: int | None = None) -> GraphRun:
     """Create a resumable graph-native run for chained prompt stages."""
 
@@ -122,7 +133,8 @@ async def execute_graph_native_run(graph_run_id: int, session_factory, client: O
             return
 
     semaphore = asyncio.Semaphore(max_concurrency)
-    previous: dict[tuple[str, int], str] = {}
+    branches = [OutputBranch(item=item, chain=(), output="") for item in items]
+    stage_outputs: dict[int, list[OutputBranch]] = {}
     for stage_index, prompt in enumerate(prompt_stages):
         with session_factory() as session:
             run = session.get(GraphRun, graph_run_id)
@@ -131,50 +143,53 @@ async def execute_graph_native_run(graph_run_id: int, session_factory, client: O
                 session.commit()
                 return
         tasks = []
-        for item in items:
-            for model in model_nodes:
+        prompt_models = _connected_models(prompt, model_nodes, edges)
+        for branch in branches:
+            for model in prompt_models:
                 tasks.append(
                     _run_invocation(
                         graph_run_id,
                         stage_index,
                         prompt,
                         model,
-                        item,
+                        branch,
                         constants,
                         nodes,
                         edges,
-                        previous.get((item.key, model.id), ""),
                         session_factory,
                         client,
                         semaphore,
                     )
                 )
         results = await asyncio.gather(*tasks)
-        previous = {(item_key, model_id): output for item_key, model_id, output in results}
+        branches = [branch for branch in results if branch.output]
+        stage_outputs[prompt.id] = branches
 
     for judge_prompt in judge_prompts:
+        target_prompt = _judge_target_prompt(judge_prompt, prompt_stages, model_nodes, edges)
+        target_branches = stage_outputs.get(target_prompt.id if target_prompt else -1, branches)
+        if not target_prompt:
+            continue
         tasks = []
-        for item in items:
-            model_pairs = [(a, b) for index, a in enumerate(model_nodes) for b in model_nodes[index + 1 :]]
-            for model_a, model_b in model_pairs:
-                output_a = previous.get((item.key, model_a.id), "")
-                output_b = previous.get((item.key, model_b.id), "")
-                if not output_a or not output_b:
-                    continue
-                for judge_model in judge_models:
+        scoped_judge_models = _connected_models(judge_prompt, judge_models, edges)
+        branches_by_item: dict[str, list[OutputBranch]] = {}
+        for branch in target_branches:
+            branches_by_item.setdefault(branch.item.key, []).append(branch)
+        for item_branches in branches_by_item.values():
+            branch_pairs = [(a, b) for index, a in enumerate(item_branches) for b in item_branches[index + 1 :]]
+            for branch_a, branch_b in branch_pairs:
+                for judge_model in scoped_judge_models:
                     tasks.append(
                         _run_judge_invocation(
                             graph_run_id,
                             judge_prompt,
+                            target_prompt,
                             judge_model,
-                            item,
                             constants,
                             nodes,
                             edges,
-                            model_a,
-                            model_b,
-                            output_a,
-                            output_b,
+                            branch_a,
+                            branch_b,
                             session_factory,
                             client,
                             semaphore,
@@ -313,46 +328,125 @@ def _graph_preflight_error(
     return None
 
 
+def _branch_input_key(branch: OutputBranch) -> str:
+    """Keep resumed invocation rows distinct for each upstream branch."""
+
+    if not branch.chain:
+        return branch.item.key
+    return f"{branch.item.key}|{_chain_key(branch.chain)}"
+
+
+def _chain_key(chain: tuple[int, ...]) -> str:
+    return ">".join(str(node_id) for node_id in chain)
+
+
+def _judge_target_prompt(judge_prompt: RuntimeNode, prompt_stages: list[RuntimeNode], model_nodes: list[RuntimeNode], edges: list[RuntimeEdge]) -> RuntimeNode | None:
+    """Find the prompt stage a judge is visually connected to."""
+
+    prompt_by_id = {prompt.id: prompt for prompt in prompt_stages}
+    incoming_prompt_ids = [
+        edge.from_node_id
+        for edge in edges
+        if edge.to_node_id == judge_prompt.id and edge.from_node_id in prompt_by_id
+    ]
+    if incoming_prompt_ids:
+        return prompt_by_id[incoming_prompt_ids[-1]]
+    model_ids = {node.id for node in model_nodes}
+    incoming_model_ids = [
+        edge.from_node_id
+        for edge in edges
+        if edge.to_node_id == judge_prompt.id and edge.from_node_id in model_ids
+    ]
+    if incoming_model_ids:
+        prompt_ids = [
+            edge.from_node_id
+            for edge in edges
+            if edge.to_node_id in incoming_model_ids and edge.from_node_id in prompt_by_id
+        ]
+        if prompt_ids:
+            return prompt_by_id[prompt_ids[-1]]
+    return prompt_stages[-1] if prompt_stages else None
+
+
+def _connected_models(source: RuntimeNode, candidates: list[RuntimeNode], edges: list[RuntimeEdge]) -> list[RuntimeNode]:
+    """Return model nodes visually connected from a prompt or judge node."""
+
+    candidate_by_id = {node.id: node for node in candidates}
+    connected_ids = [
+        edge.to_node_id
+        for edge in edges
+        if edge.from_node_id == source.id and edge.to_node_id in candidate_by_id
+    ]
+    if not connected_ids:
+        return candidates
+    seen = set()
+    scoped = []
+    for node_id in connected_ids:
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        scoped.append(candidate_by_id[node_id])
+    return scoped
+
+
+def _leaderboard_entity_key(branch: OutputBranch, _prompt: RuntimeNode) -> str:
+    """Persist the full model chain so leaderboard views can aggregate later."""
+
+    if not branch.chain:
+        return ""
+    return _chain_key(branch.chain)
+
+
+def _leaderboard_entity_label(branch: OutputBranch, prompt: RuntimeNode, nodes: list[RuntimeNode]) -> str:
+    """Return the human label for a leaderboard entity."""
+
+    by_id = {node.id: node for node in nodes}
+    entity_key = _leaderboard_entity_key(branch, prompt)
+    if not entity_key:
+        return "Unknown"
+    return " -> ".join(by_id.get(node_id).title if by_id.get(node_id) else str(node_id) for node_id in branch.chain)
+
+
 async def _run_invocation(
     graph_run_id: int,
     stage_index: int,
     prompt: GraphNode,
     model: GraphNode,
-    item: DatasetItem,
+    branch: OutputBranch,
     constants: dict[str, str],
     nodes: list[RuntimeNode],
     edges: list[RuntimeEdge],
-    previous_output: str,
     session_factory,
     client: OpenRouterClient,
     semaphore: asyncio.Semaphore,
-) -> tuple[str, int, str]:
+) -> OutputBranch:
     model_cfg = config(model)
     prompt_cfg = config(prompt)
-    values = _render_values_for_node(prompt, item, constants, nodes, edges, previous_output=previous_output)
+    item_key = _branch_input_key(branch)
+    values = _render_values_for_node(prompt, branch.item, constants, nodes, edges, previous_output=branch.output)
     rendered = render_template(prompt.body, values)
     unresolved = prompt_inputs(rendered)
     with session_factory() as session:
         run = session.get(GraphRun, graph_run_id)
         if run and run.status == Status.paused:
-            return item.key, model.id, ""
+            return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output="", prompt_id=prompt.id, stage_index=stage_index)
         existing = session.exec(
             select(GraphInvocation).where(
                 GraphInvocation.graph_run_id == graph_run_id,
                 GraphInvocation.node_id == prompt.id,
                 GraphInvocation.model_node_id == model.id,
-                GraphInvocation.item_key == item.key,
+                GraphInvocation.item_key == item_key,
                 GraphInvocation.stage_index == stage_index,
             )
         ).first()
         if existing and existing.status == Status.complete:
             output = existing.output_json if prompt_cfg.get("upstream_mode") == "json" else existing.output_raw
-            return item.key, model.id, output or ""
+            return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output=output or "", prompt_id=prompt.id, stage_index=stage_index)
         invocation = existing or GraphInvocation(
             graph_run_id=graph_run_id,
             node_id=prompt.id,
             model_node_id=model.id,
-            item_key=item.key,
+            item_key=item_key,
             stage_index=stage_index,
         )
         invocation.status = Status.running
@@ -363,7 +457,7 @@ async def _run_invocation(
             invocation.completed_at = utc_now()
             session.add(invocation)
             session.commit()
-            return item.key, model.id, ""
+            return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output="", prompt_id=prompt.id, stage_index=stage_index)
         invocation.started_at = utc_now()
         invocation.error = None
         session.add(invocation)
@@ -395,7 +489,7 @@ async def _run_invocation(
             invocation.completed_at = utc_now()
             session.add(invocation)
             session.commit()
-        return item.key, model.id, repaired if prompt_cfg.get("upstream_mode") == "json" else response.text
+        return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output=repaired if prompt_cfg.get("upstream_mode") == "json" else response.text, prompt_id=prompt.id, stage_index=stage_index)
     except Exception as exc:
         with session_factory() as session:
             invocation = session.get(GraphInvocation, invocation_id)
@@ -404,36 +498,34 @@ async def _run_invocation(
             invocation.completed_at = utc_now()
             session.add(invocation)
             session.commit()
-        return item.key, model.id, ""
+        return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output="", prompt_id=prompt.id, stage_index=stage_index)
 
 
 async def _run_judge_invocation(
     graph_run_id: int,
     judge_prompt: GraphNode,
+    target_prompt: GraphNode,
     judge_model: GraphNode,
-    item: DatasetItem,
     constants: dict[str, str],
     nodes: list[RuntimeNode],
     edges: list[RuntimeEdge],
-    model_a: GraphNode,
-    model_b: GraphNode,
-    output_a: str,
-    output_b: str,
+    branch_a: OutputBranch,
+    branch_b: OutputBranch,
     session_factory,
     client: OpenRouterClient,
     semaphore: asyncio.Semaphore,
 ) -> None:
     model_cfg = config(judge_model)
     values = {
-        **_render_values_for_node(judge_prompt, item, constants, nodes, edges),
-        "output_a": output_a,
-        "output_b": output_b,
-        "model_a": model_a.title,
-        "model_b": model_b.title,
+        **_render_values_for_node(judge_prompt, branch_a.item, constants, nodes, edges),
+        "output_a": branch_a.output,
+        "output_b": branch_b.output,
+        "model_a": _leaderboard_entity_label(branch_a, target_prompt, nodes),
+        "model_b": _leaderboard_entity_label(branch_b, target_prompt, nodes),
     }
     rendered = render_template(judge_prompt.body, values)
     unresolved = prompt_inputs(rendered)
-    item_key = f"{item.key}:{model_a.id}-vs-{model_b.id}"
+    item_key = f"{branch_a.item.key}:{_leaderboard_entity_key(branch_a, target_prompt)}-vs-{_leaderboard_entity_key(branch_b, target_prompt)}"
     with session_factory() as session:
         existing = session.exec(
             select(GraphInvocation).where(
@@ -550,31 +642,33 @@ def _sync_graph_status(session, run: GraphRun) -> None:
 
 
 def graph_run_leaderboard(session, graph_run_id: int, nodes: list[GraphNode]) -> list[dict]:
-    """Compute ELO leaderboard and per-model stats from graph-native judge invocations."""
+    """Compute the aggregate ELO leaderboard from graph-native judge invocations."""
+
+    return graph_run_leaderboards(session, graph_run_id, nodes, view_mode="aggregate")[0]["rows"]
+
+
+def graph_run_leaderboards(session, graph_run_id: int, nodes: list[GraphNode], *, view_mode: str = "aggregate") -> list[dict]:
+    """Compute aggregate and judge-prompt-scoped leaderboards."""
 
     model_lookup = {node.id: node for node in nodes}
     generator_nodes = [n for n in nodes if n.kind == "model" and config(n).get("role") == "generator"]
     judge_nodes = [n for n in nodes if n.kind == "model" and config(n).get("role") == "judge"]
     generator_ids = {n.id for n in generator_nodes}
+    run = session.get(GraphRun, graph_run_id)
+    edges = graph_edges(session, run.graph_id) if run else []
+    prompt_stages = sorted([node for node in nodes if node.kind == "prompt"], key=lambda node: (node.x, node.y, node.id or 0))
+    target_depths = _judge_target_depths([node for node in nodes if node.kind == "judge"], prompt_stages, generator_nodes, edges)
 
     invocations = session.exec(
         select(GraphInvocation).where(GraphInvocation.graph_run_id == graph_run_id)
     ).all()
 
-    # Token averages for generator models
-    token_totals: dict[int, list[int]] = {n.id: [] for n in generator_nodes}
+    token_totals: dict[str, list[int]] = {str(n.id): [] for n in generator_nodes}
     for inv in invocations:
         model = model_lookup.get(inv.model_node_id)
         if model and model.id in generator_ids and inv.status == Status.complete:
             total = (inv.prompt_tokens or 0) + (inv.completion_tokens or 0)
-            token_totals[model.id].append(total)
-
-    # Parse judge invocations to build match history
-    wins: dict[int, int] = {n.id: 0 for n in generator_nodes}
-    losses: dict[int, int] = {n.id: 0 for n in generator_nodes}
-    ties: dict[int, int] = {n.id: 0 for n in generator_nodes}
-    ratings: dict[int, float] = {n.id: 1500.0 for n in generator_nodes}
-    judge_tallies: dict[int, dict[int, int]] = {n.id: {} for n in judge_nodes}
+            token_totals[str(model.id)].append(total)
 
     judge_invs = [
         inv for inv in invocations
@@ -582,56 +676,75 @@ def graph_run_leaderboard(session, graph_run_id: int, nodes: list[GraphNode]) ->
         and model_lookup.get(inv.node_id)
         and model_lookup[inv.node_id].kind == "judge"
     ]
+    groups = [("Overall", None, judge_invs)]
+    for judge_prompt in [node for node in nodes if node.kind == "judge"]:
+        scoped = [inv for inv in judge_invs if inv.node_id == judge_prompt.id]
+        if scoped:
+            groups.append((judge_prompt.title, judge_prompt.id, scoped))
+    return [
+        {
+            "title": title,
+            "judge_prompt_node_id": judge_prompt_id,
+            "rows": _leaderboard_rows_for_invocations(scoped, model_lookup, judge_nodes, token_totals, view_mode=view_mode, target_depth=target_depths.get(judge_prompt_id) if judge_prompt_id else None),
+        }
+        for title, judge_prompt_id, scoped in groups
+    ]
 
+
+def _leaderboard_rows_for_invocations(
+    judge_invs: list[GraphInvocation],
+    model_lookup: dict[int, GraphNode],
+    judge_nodes: list[GraphNode],
+    token_totals: dict[str, list[int]],
+    *,
+    view_mode: str,
+    target_depth: int | None,
+) -> list[dict]:
+    entities: set[str] = set()
+    for inv in judge_invs:
+        parsed = _parse_judge_pair(inv.item_key)
+        if parsed:
+            display_a, display_b = _display_entities(parsed, view_mode, target_depth)
+            if display_a != display_b:
+                entities.update((display_a, display_b))
+    wins: dict[str, int] = {entity: 0 for entity in entities}
+    losses: dict[str, int] = {entity: 0 for entity in entities}
+    ties: dict[str, int] = {entity: 0 for entity in entities}
+    ratings: dict[str, float] = {entity: 1500.0 for entity in entities}
+    judge_tallies: dict[int, dict[str, int]] = {n.id: {} for n in judge_nodes}
     for inv in judge_invs:
         judge_prompt = model_lookup[inv.node_id]
         winner_key = config(judge_prompt).get("winner_key") or "winner"
-
-        # item_key format: "dataset-item-key:model_a_id-vs-model_b_id"
-        try:
-            _, pair = inv.item_key.rsplit(":", 1)
-            model_a_id_str, model_b_id_str = pair.split("-vs-")
-            model_a_id = int(model_a_id_str)
-            model_b_id = int(model_b_id_str)
-        except ValueError:
+        parsed = _parse_judge_pair(inv.item_key)
+        if not parsed:
             continue
-
-        if model_a_id not in generator_ids or model_b_id not in generator_ids:
+        entity_a, entity_b = _display_entities(parsed, view_mode, target_depth)
+        if entity_a == entity_b:
             continue
-
         try:
             result = json.loads(inv.output_json)
             winner = str(result.get(winner_key, "TIE")).upper()
         except (json.JSONDecodeError, AttributeError):
             continue
-
         judge_model = model_lookup.get(inv.model_node_id)
-
         if winner == "A":
-            wins[model_a_id] += 1
-            losses[model_b_id] += 1
-            ratings[model_a_id], ratings[model_b_id] = update_elo(
-                ratings[model_a_id], ratings[model_b_id], "A"
-            )
+            wins[entity_a] += 1
+            losses[entity_b] += 1
+            ratings[entity_a], ratings[entity_b] = update_elo(ratings[entity_a], ratings[entity_b], "A")
             if judge_model:
-                judge_tallies[judge_model.id][model_a_id] = judge_tallies[judge_model.id].get(model_a_id, 0) + 1
+                judge_tallies[judge_model.id][entity_a] = judge_tallies[judge_model.id].get(entity_a, 0) + 1
         elif winner == "B":
-            wins[model_b_id] += 1
-            losses[model_a_id] += 1
-            ratings[model_a_id], ratings[model_b_id] = update_elo(
-                ratings[model_a_id], ratings[model_b_id], "B"
-            )
+            wins[entity_b] += 1
+            losses[entity_a] += 1
+            ratings[entity_a], ratings[entity_b] = update_elo(ratings[entity_a], ratings[entity_b], "B")
             if judge_model:
-                judge_tallies[judge_model.id][model_b_id] = judge_tallies[judge_model.id].get(model_b_id, 0) + 1
+                judge_tallies[judge_model.id][entity_b] = judge_tallies[judge_model.id].get(entity_b, 0) + 1
         else:
-            ties[model_a_id] += 1
-            ties[model_b_id] += 1
-            ratings[model_a_id], ratings[model_b_id] = update_elo(
-                ratings[model_a_id], ratings[model_b_id], "TIE"
-            )
+            ties[entity_a] += 1
+            ties[entity_b] += 1
+            ratings[entity_a], ratings[entity_b] = update_elo(ratings[entity_a], ratings[entity_b], "TIE")
 
-    # Compute judge favorites
-    favorites: dict[int, list[GraphNode]] = {n.id: [] for n in generator_nodes}
+    favorites: dict[str, list[GraphNode]] = {entity: [] for entity in entities}
     for judge_id, tallies in judge_tallies.items():
         if not tallies:
             continue
@@ -641,18 +754,92 @@ def graph_run_leaderboard(session, graph_run_id: int, nodes: list[GraphNode]) ->
             favorites[favorite_id].append(judge_model)
 
     rows = []
-    for node in generator_nodes:
+    for entity in entities:
+        node = _entity_last_node(entity, model_lookup)
+        totals = token_totals.get(entity, []) or token_totals.get(str(node.id) if node else "", [])
         rows.append(
             {
+                "entity_key": entity,
+                "label": _entity_label(entity, model_lookup),
                 "node": node,
-                "rating": ratings[node.id],
-                "wins": wins[node.id],
-                "losses": losses[node.id],
-                "ties": ties[node.id],
-                "avg_tokens": f"{sum(token_totals[node.id]) // len(token_totals[node.id]):,}" if token_totals[node.id] else "-",
-                "favorites": favorites.get(node.id, []),
+                "rating": ratings[entity],
+                "wins": wins[entity],
+                "losses": losses[entity],
+                "ties": ties[entity],
+                "avg_tokens": f"{sum(totals) // len(totals):,}" if totals else "-",
+                "favorites": favorites.get(entity, []),
             }
         )
 
     rows.sort(key=lambda r: r["rating"], reverse=True)
     return rows
+
+
+def _parse_judge_pair(item_key: str) -> tuple[str, str] | None:
+    try:
+        _item, pair = item_key.rsplit(":", 1)
+        entity_a, entity_b = pair.split("-vs-", 1)
+        return entity_a, entity_b
+    except ValueError:
+        return None
+
+
+def _display_entities(pair: tuple[str, str], view_mode: str, target_depth: int | None) -> tuple[str, str]:
+    pair = (_truncate_entity(pair[0], target_depth), _truncate_entity(pair[1], target_depth))
+    if view_mode == "chain":
+        return pair
+    return _entity_final_model(pair[0]), _entity_final_model(pair[1])
+
+
+def _truncate_entity(entity: str, target_depth: int | None) -> str:
+    if not target_depth:
+        return entity
+    return ">".join(entity.split(">")[:target_depth])
+
+
+def _entity_final_model(entity: str) -> str:
+    return entity.split(">")[-1]
+
+
+def _judge_target_depths(
+    judge_prompts: list[GraphNode],
+    prompt_stages: list[GraphNode],
+    generator_models: list[GraphNode],
+    edges: list[GraphEdge],
+) -> dict[int, int]:
+    """Map judge prompt ids to the prompt-stage depth they visually judge."""
+
+    prompt_by_id = {prompt.id: prompt for prompt in prompt_stages}
+    generator_model_ids = {node.id for node in generator_models}
+    depths = {}
+    for judge_prompt in judge_prompts:
+        target = None
+        incoming = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in prompt_by_id]
+        if incoming:
+            target = prompt_by_id[incoming[-1]]
+        else:
+            incoming_models = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in generator_model_ids]
+            prompt_ids = [edge.from_node_id for edge in edges if edge.to_node_id in incoming_models and edge.from_node_id in prompt_by_id]
+            if prompt_ids:
+                target = prompt_by_id[prompt_ids[-1]]
+        if target and judge_prompt.id:
+            depths[judge_prompt.id] = prompt_stages.index(target) + 1
+    return depths
+
+
+def _entity_last_node(entity: str, model_lookup: dict[int, GraphNode]) -> GraphNode | None:
+    try:
+        return model_lookup.get(int(entity.split(">")[-1]))
+    except ValueError:
+        return None
+
+
+def _entity_label(entity: str, model_lookup: dict[int, GraphNode]) -> str:
+    labels = []
+    for part in entity.split(">"):
+        try:
+            node = model_lookup.get(int(part))
+        except ValueError:
+            node = None
+        labels.append(node.title if node else part)
+    return " -> ".join(labels)

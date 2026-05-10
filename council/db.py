@@ -36,6 +36,15 @@ def init_db() -> None:
             connection.execute(text("ALTER TABLE graphinvocation ADD COLUMN duration_seconds FLOAT"))
         if graph_invocation_columns and "output_tokens_per_second" not in graph_invocation_columns:
             connection.execute(text("ALTER TABLE graphinvocation ADD COLUMN output_tokens_per_second FLOAT"))
+        graph_analysis_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphrunanalysis)").all()}
+        for column_name, column_type in {
+            "judge_prompt_node_id": "INTEGER",
+            "leaderboard_view": "VARCHAR DEFAULT 'aggregate'",
+            "top_entity_key": "VARCHAR DEFAULT ''",
+            "top_entity_label": "VARCHAR DEFAULT ''",
+        }.items():
+            if graph_analysis_columns and column_name not in graph_analysis_columns:
+                connection.execute(text(f"ALTER TABLE graphrunanalysis ADD COLUMN {column_name} {column_type}"))
         generation_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(generation)").all()}
         if "started_at" not in generation_columns:
             connection.execute(text("ALTER TABLE generation ADD COLUMN started_at DATETIME"))

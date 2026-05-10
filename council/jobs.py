@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 from sqlmodel import Session
 
-from council.analysis import generate_judge_pattern_analysis
+from council.analysis import generate_graph_run_judge_summary, generate_judge_pattern_analysis
 from council.graph_runtime import execute_graph_native_run
 from council.models import ExperimentGraph, GraphRun, GraphStatus, Run, Status
 from council.runner import execute_run
@@ -19,6 +19,7 @@ SessionFactory = Callable[[], Session]
 RUN_THREADS: dict[int, threading.Thread] = {}
 GRAPH_RUN_THREADS: dict[int, threading.Thread] = {}
 ANALYSIS_THREADS: dict[int, threading.Thread] = {}
+GRAPH_ANALYSIS_THREADS: dict[tuple[int, int | None, str, str], threading.Thread] = {}
 
 
 def start_run_thread(run_id: int, session_factory: SessionFactory) -> None:
@@ -56,6 +57,34 @@ def start_analysis_thread(run_id: int, session_factory: SessionFactory) -> None:
         asyncio.run(generate_judge_pattern_analysis(run_id, session_factory))
 
     _start_thread(ANALYSIS_THREADS, run_id, target)
+
+
+def start_graph_analysis_thread(
+    graph_run_id: int,
+    session_factory: SessionFactory,
+    *,
+    judge_prompt_node_id: int | None = None,
+    leaderboard_view: str = "aggregate",
+    top_entity_key: str = "",
+) -> None:
+    """Start a graph-run judge summary worker if one is not already active."""
+
+    key = (graph_run_id, judge_prompt_node_id, leaderboard_view, top_entity_key)
+    if _thread_is_running(GRAPH_ANALYSIS_THREADS, key):
+        return
+
+    def target() -> None:
+        asyncio.run(
+            generate_graph_run_judge_summary(
+                graph_run_id,
+                session_factory,
+                judge_prompt_node_id=judge_prompt_node_id,
+                leaderboard_view=leaderboard_view,
+                top_entity_key=top_entity_key,
+            )
+        )
+
+    _start_thread(GRAPH_ANALYSIS_THREADS, key, target)
 
 
 def start_graph_run_thread(graph_run_id: int, session_factory: SessionFactory) -> None:

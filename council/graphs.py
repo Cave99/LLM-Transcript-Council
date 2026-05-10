@@ -419,6 +419,7 @@ def plan_graph(session: Session, graph_id: int) -> GraphPlan:
     """Calculate call counts and validation warnings for the visible graph."""
 
     nodes = graph_nodes(session, graph_id)
+    edges = graph_edges(session, graph_id)
     dataset = _one(nodes, "dataset")
     prompt_stages = _prompt_stages(nodes)
     generator_prompt = prompt_stages[0] if prompt_stages else None
@@ -427,13 +428,13 @@ def plan_graph(session: Session, graph_id: int) -> GraphPlan:
     judge_models = _models(nodes, "judge")
     settings = config(judge_prompt) if judge_prompt else {}
     transcript_count = _transcript_count(dataset)
-    pair_count = math.comb(len(generator_models), 2) if len(generator_models) >= 2 else 0
+    stage_model_counts = [_connected_model_count(prompt, generator_models, edges) for prompt in prompt_stages]
+    pair_count = _graph_pair_count(prompt_stages, judge_prompt, edges, stage_model_counts, generator_models)
     sample_pct = _sample_pct(settings)
     sampled_per_transcript = _sampled_pair_count(pair_count, sample_pct)
-    generation_calls = transcript_count * len(generator_models) * max(1, len(prompt_stages))
-    match_count = transcript_count * sampled_per_transcript
+    generation_calls = _graph_generation_calls(transcript_count, stage_model_counts)
+    match_count, judge_calls = _graph_judge_counts(transcript_count, prompt_stages, [node for node in nodes if node.kind == "judge"], edges, stage_model_counts, generator_models, judge_models)
     swap_multiplier = 2 if settings.get("swap_enabled", True) else 1
-    judge_calls = match_count * len(judge_models) * swap_multiplier
     warnings = list(_plan_warnings(dataset, generator_prompt, judge_prompt, generator_models, judge_models, transcript_count))
     if pair_count and sampled_per_transcript < pair_count and transcript_count * sampled_per_transcript < pair_count:
         warnings.append("Sampling is too low to cover every model pair at least once.")
@@ -619,6 +620,89 @@ def _sampled_pair_count(pair_count: int, sample_pct: float) -> int:
     if sample_pct >= 100:
         return pair_count
     return max(1, round(pair_count * (sample_pct / 100.0)))
+
+
+def _graph_judge_counts(
+    transcript_count: int,
+    prompt_stages: list[GraphNode],
+    judge_prompts: list[GraphNode],
+    edges: list[GraphEdge],
+    stage_model_counts: list[int],
+    generator_models: list[GraphNode],
+    judge_models: list[GraphNode],
+) -> tuple[int, int]:
+    """Estimate judge work using each judge prompt's visual target stage."""
+
+    match_count = 0
+    judge_calls = 0
+    for judge_prompt in judge_prompts:
+        pair_count = _graph_pair_count(prompt_stages, judge_prompt, edges, stage_model_counts, generator_models)
+        sampled = _sampled_pair_count(pair_count, _sample_pct(config(judge_prompt)))
+        matches = transcript_count * sampled
+        swap_multiplier = 2 if config(judge_prompt).get("swap_enabled", True) else 1
+        match_count += matches
+        judge_calls += matches * _connected_model_count(judge_prompt, judge_models, edges) * swap_multiplier
+    return match_count, judge_calls
+
+
+def _graph_pair_count(prompt_stages: list[GraphNode], judge_prompt: GraphNode | None, edges: list[GraphEdge], stage_model_counts: list[int], generator_models: list[GraphNode]) -> int:
+    """Estimate pair count per dataset item for a judge's target prompt."""
+
+    if not prompt_stages:
+        return 0
+    target_prompt = _judge_target_prompt(judge_prompt, prompt_stages, edges, generator_models)
+    stage_number = prompt_stages.index(target_prompt) + 1 if target_prompt in prompt_stages else len(prompt_stages)
+    branch_count = _branch_count_after_stage(stage_model_counts, stage_number)
+    return math.comb(branch_count, 2) if branch_count >= 2 else 0
+
+
+def _graph_generation_calls(transcript_count: int, stage_model_counts: list[int]) -> int:
+    """Estimate generation calls with per-prompt connected model counts."""
+
+    branches_per_item = 1
+    total = 0
+    for model_count in stage_model_counts:
+        calls_per_item = branches_per_item * model_count
+        total += transcript_count * calls_per_item
+        branches_per_item = calls_per_item
+    return total
+
+
+def _branch_count_after_stage(stage_model_counts: list[int], stage_number: int) -> int:
+    branches = 1
+    for model_count in stage_model_counts[:stage_number]:
+        branches *= model_count
+    return branches
+
+
+def _connected_model_count(source: GraphNode, candidates: list[GraphNode], edges: list[GraphEdge]) -> int:
+    """Count models visually connected from a prompt or judge, fallback to all."""
+
+    candidate_ids = {node.id for node in candidates}
+    connected_ids = []
+    for edge in edges:
+        if edge.from_node_id == source.id and edge.to_node_id in candidate_ids and edge.to_node_id not in connected_ids:
+            connected_ids.append(edge.to_node_id)
+    return len(connected_ids) if connected_ids else len(candidates)
+
+
+def _judge_target_prompt(judge_prompt: GraphNode | None, prompt_stages: list[GraphNode], edges: list[GraphEdge], generator_models: list[GraphNode]) -> GraphNode | None:
+    """Find the prompt connected to a judge, falling back to the final stage."""
+
+    if not prompt_stages:
+        return None
+    prompt_by_id = {prompt.id: prompt for prompt in prompt_stages}
+    if judge_prompt:
+        incoming = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in prompt_by_id]
+        if incoming:
+            return prompt_by_id[incoming[-1]]
+        generator_model_ids = {node.id for node in generator_models}
+        incoming_models = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in generator_model_ids]
+        if incoming_models:
+            prompt_ids = [edge.from_node_id for edge in edges if edge.to_node_id in incoming_models and edge.from_node_id in prompt_by_id]
+            if prompt_ids:
+                return prompt_by_id[prompt_ids[-1]]
+    return prompt_stages[-1]
 
 
 def _plan_warnings(

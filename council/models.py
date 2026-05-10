@@ -162,6 +162,22 @@ class RunAnalysis(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class GraphRunAnalysis(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    graph_run_id: int = Field(foreign_key="graphrun.id")
+    top_model_node_id: int = Field(foreign_key="graphnode.id")
+    judge_prompt_node_id: Optional[int] = Field(default=None, foreign_key="graphnode.id")
+    leaderboard_view: str = "aggregate"
+    top_entity_key: str = ""
+    top_entity_label: str = ""
+    model_id: str
+    win_sample_size: int = 0
+    loss_sample_size: int = 0
+    summary: str
+    prompt_snapshot: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class GeneratorConfig(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id")

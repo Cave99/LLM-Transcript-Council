@@ -1490,10 +1490,29 @@ tbody tr:hover td {
   gap: 10px;
 }
 
-.output-model-group > .panel {
-  padding: 14px;
-  border-radius: 6px;
-  box-shadow: none;
+.output-browser-group .output-model-group {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  border-top: 1px solid var(--line);
+}
+
+.output-browser-group .output-model-group:first-of-type {
+  border-top: none;
+}
+
+.output-model-group > .output-invocation {
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+  background: transparent;
+}
+
+.output-model-group > .output-invocation:first-of-type {
+  border-top: none;
+}
+
+.output-invocation[open] > summary::before {
+  transform: rotate(45deg);
 }
 
 .inline-form {
@@ -1504,7 +1523,13 @@ tbody tr:hover td {
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  margin-top: 14px;
   margin-bottom: 10px;
+}
+
+.analysis-form button {
+  min-height: 46px;
+  padding: 12px 20px;
 }
 
 .analysis-form button:disabled {
@@ -1598,10 +1623,58 @@ tbody tr:hover td {
   font-size: 11px;
   font-weight: 720;
   cursor: help;
-  max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.leaderboard-group {
+  margin-top: 18px;
+}
+
+.leaderboard-group + .leaderboard-group {
+  margin-top: 28px;
+}
+
+.leaderboard-title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.leaderboard-title-row h3 {
+  margin: 0;
+}
+
+.leaderboard-analysis-form {
+  margin: 0;
+}
+
+.leaderboard-analysis-form button {
+  min-height: 34px;
+  padding: 7px 12px;
+  font-size: 12px;
+}
+
+.leaderboard-view-toggle {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 6px;
+}
+
+.leaderboard-view-toggle .button {
+  min-height: 34px;
+  padding: 7px 11px;
+  font-size: 12px;
+}
+
+.leaderboard-view-toggle .is-active {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .judged-by {
