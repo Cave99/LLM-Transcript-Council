@@ -8,4 +8,7 @@ __pycache__/
 .sesskey
 judge_council.db
 judge_council.db-*
-
+node_modules/
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo

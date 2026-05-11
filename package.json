@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k \"uv run uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000\" \"pnpm --dir frontend dev\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "packageManager": "pnpm@11.0.9"
+}
+

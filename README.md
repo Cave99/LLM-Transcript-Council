@@ -2,7 +2,7 @@
 
 Local LLM-as-judge framework for comparing subjective LLM outputs without building a labelled dataset for every prompt iteration.
 
-The app runs multiple generator configurations over call transcripts, asks one or more judge models to compare two outputs at a time, validates votes with swapped A/B positions, and ranks configurations with ELO.
+The app lets users draft graph-native LLM evaluation workflows, run prompt/model chains over transcript or CSV datasets, ask judge models to compare outputs, and rank configurations with ELO-style leaderboards.
 
 ## Start Here
 
@@ -11,9 +11,9 @@ If you are an agent jumping into the repo, read these in order:
 1. `README.md` for the end-to-end mental model.
 2. `AGENTS.md` for the shortest path to the code paths that matter.
 3. `prompts/` for the markdown templates that drive runs.
-4. `council/runner.py` for the top-level run lifecycle.
-5. `council/generation.py`, `council/judging.py`, and `council/leaderboard.py` for execution phases.
-6. `app.py` for the local UI and route handlers.
+4. `backend/main.py` and `backend/api/` for the JSON API layer.
+5. `frontend/src/` for the React UI.
+6. `council/graphs.py` and `council/graph_runtime.py` for graph planning and execution.
 
 ## Quick Start
 
@@ -21,10 +21,13 @@ If you are an agent jumping into the repo, read these in order:
 cp .env.example .env
 # Add OPENROUTER_API_KEY to .env
 uv sync --extra dev --extra repair
-uv run python app.py
+pnpm install
+pnpm dev
 ```
 
-Open `http://127.0.0.1:5001`.
+Open `http://127.0.0.1:5173`.
+
+The split app runs a FastAPI backend on `http://127.0.0.1:8000` and a Vite React frontend on `http://127.0.0.1:5173`. Vite proxies `/api` requests to FastAPI during local development.
 
 ## What This App Does
 
@@ -44,21 +47,19 @@ Instead of tuning a judge rubric for every project, the default judge prompt com
 - Generator prompts live in `prompts/generators/`.
 - Judge prompts live in `prompts/judges/`.
 - Transcript markdown lives in `transcripts/`.
-- `app.py` is the local FastHTML shell: routes, forms, tables, and page rendering.
+- `backend/` is the FastAPI API layer for the graph-native workflow.
+- `frontend/` is the React, TypeScript, Tailwind, shadcn-style, and React Flow UI.
+- `app.py` is the legacy local FastHTML shell kept temporarily during the migration; do not add new UI there.
 - `council/models.py` defines the SQLite entities and status enums.
-- `council/runner.py` owns run creation, reset/recover/stop, and the top-level execution sequence.
-- `council/run_rows.py` creates derived generation, match, and leaderboard rows when a run is created.
-- `council/generation.py` runs generator model calls and stores outputs.
-- `council/judging.py` runs pairwise judge calls, including swapped A/B validation.
-- `council/leaderboard.py` applies and rebuilds ELO leaderboard state.
-- `council/run_state.py` contains shared run progress, pause checks, and run logging.
-- `council/jobs.py` starts local background threads for runs and judge-pattern analysis.
-- `council/analysis.py` samples judge reasoning traces and persists judge-pattern summaries.
-- `council/reports.py` contains read-only reporting queries for UI tables.
+- `council/graphs.py` owns graph drafts, nodes, edges, planning, and socket discovery.
+- `council/graph_runtime.py` executes graph-native runs and computes graph-native leaderboards.
+- `council/jobs.py` starts local background threads for graph runs and judge-summary analysis.
+- `council/analysis.py` samples graph judge reasoning traces and persists judge summaries.
 - `council/judge.py` renders prompts and parses judge responses.
 - `council/files.py` snapshots markdown files.
 - `council/json_tools.py` repairs and parses JSON-ish model output.
-- `council/elo.py` contains pure ELO and vote reconciliation logic.
+- `council/elo.py` contains pure ELO math used by graph-native leaderboards.
+- `council/runner.py`, `council/generation.py`, `council/judging.py`, `council/leaderboard.py`, `council/run_rows.py`, `council/run_state.py`, and `council/reports.py` are legacy traditional-run modules kept until the migration cleanup phase.
 
 ## Prompt Placeholders
 
@@ -74,24 +75,34 @@ Keep prompt files markdown-only and simple. The renderer does straight string re
 ## Run Defaults
 
 - SQLite database: `judge_council.db`
-- 3 judge configs recommended
-- A/B swap validation enabled
+- graph-native runs default to max concurrency 5
+- test runs use one dataset item
+- full runs use the dataset node selection
+- judge prompts can sample pairwise comparisons
 - ELO starts at 1500
-- K-factor is 32
-- Max concurrent LLM calls defaults to 5
 
 ## Data Flow
 
-1. A task snapshots a task description, transcript root, and default judge prompt.
-2. A run snapshots generator prompts, judge prompts, model IDs, temperatures, and transcripts.
-3. `council/run_rows.py` prebuilds generation rows, sampled match rows, and initial leaderboard rows.
-4. `council/jobs.py` starts a local background worker.
-5. `council/runner.py` marks the run active and coordinates generation, judging, and leaderboard phases.
-6. `council/generation.py` produces one output per transcript per generator config.
-7. `council/judging.py` compares generator pairs with one or more judge models.
-8. Swapped A/B votes are remapped back into the original positions.
-9. `council/leaderboard.py` updates ELO from completed match results.
-10. Everything is stored as historical evidence so earlier runs stay explainable after files change.
+1. A project owns one or more local experiment graphs.
+2. A graph stores dataset, constant, prompt, model, and judge nodes plus socket edges.
+3. `council/graphs.py` computes the launch plan and warnings from persisted graph rows.
+4. The React UI launches a graph run through `POST /api/graphs/{id}/launch`.
+5. `council/jobs.py` starts a local background thread.
+6. `council/graph_runtime.py` executes prompt stages over each dataset item and model branch.
+7. Judge prompt nodes compare branch pairs and persist each judge call as a `GraphInvocation`.
+8. Graph run pages compute progress, diagnostics, model output groups, judge summaries, and ELO-style leaderboards from persisted invocation evidence.
+
+## Frontend / Backend Split
+
+The graph-native workflow is now exposed through JSON APIs under `/api`:
+
+- `/api/projects` for project CRUD and recent graph runs
+- `/api/graphs` for graph drafts, planning, launch, fork, and delete
+- `/api/nodes` and `/api/edges` for React Flow graph editing
+- `/api/graph-runs` for run reports, stop, continue, retry failures, and progress events
+- `/api/graph-runs/{id}/judge-summary` for background judge-summary analysis
+
+The React app is intentionally styled to match the original calm local workbench. Tailwind design tokens mirror the OKLCH colors in `DESIGN.md`; shadcn-style primitives are local components in `frontend/src/components/ui/`.
 
 ## Node Graphs
 
@@ -105,11 +116,11 @@ Current graph launch support covers:
 - `{{ socket }}` discovery after prompt save
 - reusable model nodes for generator or judge roles
 - pairwise sample percentage and run-level A/B swap validation
-- compilation into the existing run, generation, match, judgement, and ELO tables
 - graph-native chained prompt runs that pass `{{ previous_output }}` between prompt stages
 - raw-text or repaired-JSON upstream output mode on prompt nodes
 - draggable node positioning persisted on the graph
 - completed graph configs that can be forked into editable drafts
+- React Flow graph editing through the Vite frontend
 
 Planned extensions:
 
@@ -124,20 +135,21 @@ BAML is a good fit for the structured-output layer, not for owning the graph its
 
 ## Working Boundaries
 
-- Put route handlers and HTML-rendering helpers in `app.py`.
+- Put API route handlers in `backend/api/`.
+- Put React screens and graph UI in `frontend/src/`.
 - Put background-thread launch mechanics in `council/jobs.py`.
-- Put model-call phases in `council/generation.py`, `council/judging.py`, or `council/analysis.py`.
-- Put read-only UI metrics in `council/reports.py`.
-- Keep `council/runner.py` as the short lifecycle coordinator rather than a home for every run detail.
+- Put graph runtime behavior in `council/graph_runtime.py`.
+- Put graph draft/planning behavior in `council/graphs.py`.
+- Put judge-summary behavior in `council/analysis.py`.
 - Keep pure scoring/vote math in `council/elo.py`.
 
 ## Editing Rules
 
 - Prefer small markdown prompts over complex prompt frameworks.
 - Prefer snapshotting inputs at run creation over live references.
-- Prefer single-purpose helpers in `council/` and thin UI code in `app.py`.
+- Prefer single-purpose helpers in `council/`, thin FastAPI route handlers, and typed React API calls.
 - If you add new runtime behavior, document the function and add a test where practical.
 
 ## Notes
 
-OpenRouter model IDs are entered manually. The app snapshots all prompt, transcript, model, and temperature settings at run creation, so previous results remain auditable even when files change later.
+OpenRouter model IDs are entered manually. Graph run evidence is persisted in `GraphInvocation` rows so previous results remain auditable even when graph drafts change later.

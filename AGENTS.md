@@ -5,50 +5,55 @@ This repo is intentionally local, simple, and auditable. If you are an agent sta
 ## First Moves
 
 1. Read `README.md`.
-2. Inspect `council/runner.py` for the top-level run lifecycle.
-3. Inspect `app.py` for the UI and route handlers.
-4. Inspect the phase module for the thing you are changing.
-5. Look at the prompt files in `prompts/` before changing evaluation behavior.
-6. Run the tests that touch the area you edit.
+2. Inspect `backend/main.py` and the relevant `backend/api/` router for request boundaries.
+3. Inspect `frontend/src/` for React screens and client-side graph behavior.
+4. Inspect `council/graphs.py` for graph drafts, sockets, planning, and node/edge persistence.
+5. Inspect `council/graph_runtime.py` for graph-native execution and leaderboards.
+6. Look at prompt files in `prompts/` before changing evaluation behavior.
+7. Run the tests that touch the area you edit.
 
 ## Mental Model
 
-- `Task` owns the snapshot of the evaluation question.
-- `Run` owns one experiment with fixed generator and judge configs.
-- `Generation` stores one model output for one transcript.
-- `Match` stores one pairwise comparison between two generator configs.
-- `Judgement` stores each judge vote, including swapped A/B validation.
-- `MatchResult` stores the final winner and agreement.
-- `EloRating` stores the leaderboard state for a run.
+- `Project` groups local evaluation graphs.
+- `ExperimentGraph` owns one editable graph draft.
+- `GraphNode` stores dataset, prompt, constant, model, and judge nodes.
+- `GraphEdge` stores socket-level graph connections.
+- `GraphRun` owns one graph-native execution.
+- `GraphInvocation` stores generator and judge model calls, prompts, outputs, token stats, errors, and timing.
+- `GraphRunAnalysis` stores judge-summary analysis for graph run leaderboards.
+- Traditional `Task`, `Run`, `Generation`, `Match`, `Judgement`, `MatchResult`, and `EloRating` models are legacy migration leftovers. Do not build new behavior on them.
 
 ## Where To Look
 
-- UI routes and rendering: `app.py`
-- Run lifecycle and public run actions: `council/runner.py`
+- API routes: `backend/api/`
+- API schemas: `backend/schemas.py`
+- React app shell and routes: `frontend/src/app.tsx`
+- API client and frontend types: `frontend/src/api/`
+- React Flow graph editor: `frontend/src/features/graphs/` and `frontend/src/features/graph-editor/`
+- Graph run report UI: `frontend/src/features/graph-runs/`
 - Background thread startup: `council/jobs.py`
-- Derived work rows: `council/run_rows.py`
-- Generation phase: `council/generation.py`
-- Judging phase and swapped A/B calls: `council/judging.py`
-- Leaderboard persistence: `council/leaderboard.py`
-- Run progress, pause checks, and logs: `council/run_state.py`
-- Judge-pattern analysis: `council/analysis.py`
-- Read-only UI metrics and report queries: `council/reports.py`
+- Graph drafts, sockets, and planning: `council/graphs.py`
+- Graph-native execution and leaderboards: `council/graph_runtime.py`
+- Judge-summary analysis: `council/analysis.py`
 - Models and status enums: `council/models.py`
 - Prompt rendering and parsing: `council/judge.py`
 - ELO logic: `council/elo.py`
 - File snapshots: `council/files.py`
 - JSON helpers: `council/json_tools.py`
 - Database bootstrap: `council/db.py`
+- Legacy FastHTML UI: `app.py`
+- Legacy traditional-run modules: `council/runner.py`, `council/generation.py`, `council/judging.py`, `council/leaderboard.py`, `council/run_rows.py`, `council/run_state.py`, `council/reports.py`
 
 ## Working Boundaries
 
-- Keep `app.py` calm: route handlers should validate, call a `council/` helper, and render or redirect.
+- Keep FastAPI route handlers calm: validate, call a `council/` helper, and return typed schemas.
+- Keep React UI state in `frontend/src/`; do not add new UI to legacy `app.py`.
 - Keep model calls out of request handlers. Use `council/jobs.py` for local background work.
-- Keep `council/runner.py` short. It should coordinate phases, not own phase details.
-- Put new generation behavior in `council/generation.py`.
-- Put new judge behavior in `council/judging.py`.
-- Put new analysis/reporting behavior in `council/analysis.py` or `council/reports.py`.
-- Put pure score math in `council/elo.py`; put persisted leaderboard changes in `council/leaderboard.py`.
+- Put new graph generation or judging behavior in `council/graph_runtime.py`.
+- Put graph draft/planning changes in `council/graphs.py`.
+- Put new judge-summary behavior in `council/analysis.py`.
+- Put pure score math in `council/elo.py`.
+- Keep legacy traditional-run modules stable until they are intentionally deleted in a cleanup phase.
 
 ## Editing Style
 
@@ -61,14 +66,23 @@ This repo is intentionally local, simple, and auditable. If you are an agent sta
 
 The current tests are focused on the evaluation core. When changing behavior, update or add tests near:
 
+- `tests/test_api.py`
+- `tests/test_graphs.py`
 - `tests/test_runner.py`
 - `tests/test_elo.py`
 - `tests/test_judge.py`
 - `tests/test_files.py`
 
+For frontend changes, run:
+
+- `pnpm --filter ./frontend build`
+
+For backend/core changes, run:
+
+- `uv run pytest`
+
 ## Things To Preserve
 
-- Snapshot inputs at run creation.
-- Keep runs explainable after files change.
-- Preserve swapped A/B validation for judging.
+- Keep graph runs explainable after graph files or node drafts change.
+- Preserve persisted `GraphInvocation` evidence.
 - Keep the UI calm and inspectable rather than decorative.
