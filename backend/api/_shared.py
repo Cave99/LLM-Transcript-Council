@@ -140,12 +140,19 @@ def graph_detail(session: Session, graph: ExperimentGraph) -> schemas.GraphDetai
     if graph.last_run_id:
         latest = session.get(GraphRun, graph.last_run_id)
         latest_run = graph_run_summary(latest) if latest else None
+    graph_runs = session.exec(
+        select(GraphRun)
+        .where(GraphRun.graph_id == graph.id)
+        .order_by(GraphRun.created_at.desc())
+        .limit(25)
+    ).all()
     return schemas.GraphDetail(
         graph=graph_summary(graph),
         nodes=[node_dto(node) for node in graph_nodes(session, graph.id)],
         edges=[edge_dto(edge) for edge in graph_edges(session, graph.id)],
         plan=graph_plan_dto(session, graph.id),
         latest_run=latest_run,
+        graph_runs=[graph_run_summary(run) for run in graph_runs],
     )
 
 
@@ -155,10 +162,10 @@ def input_sockets(node: GraphNode, cfg: dict | None = None) -> list[str]:
         return prompt_inputs(node.body)
     if node.kind == "judge":
         sockets = prompt_inputs(node.body)
-        defaults = ["output_a", "output_b"]
+        defaults = ["models", "output", "output_a", "output_b"]
         return unique([*sockets, *defaults])
     if node.kind == "model":
-        return ["model"]
+        return ["model", "prompt", "judge_prompt"]
     return []
 
 
@@ -173,9 +180,9 @@ def output_sockets(node: GraphNode, cfg: dict | None = None) -> list[str]:
     if node.kind == "prompt":
         return ["output", "full_prompt", "template"]
     if node.kind == "model":
-        return ["model"]
+        return ["model", "raw", "json"]
     if node.kind == "judge":
-        return ["judgement"]
+        return ["judgement", "judge_prompt"]
     return []
 
 

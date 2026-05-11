@@ -85,6 +85,7 @@ export type GraphDetail = {
   edges: GraphEdgeDto[];
   plan: GraphPlanDto;
   latest_run: GraphRunSummary | null;
+  graph_runs: GraphRunSummary[];
 };
 
 export type GraphProgress = {
@@ -170,4 +171,3 @@ export type GraphRunDetail = {
   invocations: GraphInvocationDto[];
   analyses: GraphRunAnalysisDto[];
 };
-

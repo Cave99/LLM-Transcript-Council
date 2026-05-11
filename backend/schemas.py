@@ -127,6 +127,7 @@ class GraphDetail(BaseModel):
     edges: list[GraphEdgeDto]
     plan: GraphPlanDto
     latest_run: GraphRunSummary | None = None
+    graph_runs: list[GraphRunSummary] = Field(default_factory=list)
 
 
 class LaunchGraphRunRequest(BaseModel):

@@ -49,10 +49,18 @@ def test_project_graph_node_edge_api_flow(tmp_path):
         assert updated["title"] == "Prompt A"
         assert updated["input_sockets"] == ["transcript"]
 
+        judge = client.post(f"/api/graphs/{graph['id']}/nodes", json={"kind": "judge"}).json()
+        model = client.post(f"/api/graphs/{graph['id']}/nodes", json={"kind": "model"}).json()
+        assert "models" in judge["input_sockets"]
+        assert "judge_prompt" in judge["output_sockets"]
+        assert "prompt" in model["input_sockets"]
+        assert "raw" in model["output_sockets"]
+
         detail = client.get(f"/api/graphs/{graph['id']}").json()
         assert detail["graph"]["id"] == graph["id"]
-        assert len(detail["nodes"]) == 2
+        assert len(detail["nodes"]) == 4
         assert len(detail["edges"]) == 1
+        assert detail["graph_runs"] == []
         assert "generation_calls" in detail["plan"]
     finally:
         app.dependency_overrides.clear()
@@ -80,6 +88,9 @@ def test_graph_run_detail_api_returns_progress(tmp_path):
         assert detail["progress"]["total"] == 0
         assert detail["leaderboards"]
         assert detail["invocations"] == []
+
+        graph_detail = client.get(f"/api/graphs/{graph_id}").json()
+        assert [item["id"] for item in graph_detail["graph_runs"]] == [run["id"]]
     finally:
         app.dependency_overrides.clear()
 
