@@ -1,11 +1,11 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams } from "react-router-dom";
 import ReactFlow, { Background, Controls, type Edge, type Node, Position, Handle } from "reactflow";
 import { Database, FileText, Gavel, MessageSquare, RotateCcw, Settings, Square, StepForward } from "lucide-react";
 import { client } from "../../api/client";
 import { queryClient } from "../../api/queries";
-import type { GraphInvocationDto, GraphNodeDto, GraphProgress, LeaderboardView } from "../../api/types";
+import type { GraphInvocationDto, GraphNodeDto, GraphProgress, GraphRunDetail, LeaderboardView } from "../../api/types";
 import { Button } from "../../components/ui/button";
 import { Progress } from "../../components/ui/progress";
 import { Table } from "../../components/ui/table";
@@ -16,11 +16,9 @@ const runNodeTypes = { runPreview: RunPreviewNode };
 
 export function GraphRunPage() {
   const runId = Number(useParams().graphRunId);
-  const [params, setParams] = useSearchParams();
-  const view = ((params.get("leaderboard_view") || "aggregate") as LeaderboardView);
   const { data, isLoading, error } = useQuery({
-    queryKey: ["graph-run", runId, view],
-    queryFn: () => client.graphRun(runId, view),
+    queryKey: ["graph-run", runId, "base"],
+    queryFn: () => client.graphRun(runId, "aggregate"),
     enabled: Number.isFinite(runId),
     refetchInterval: (query) => query.state.data?.run.status === "running" ? 5000 : false
   });
@@ -28,7 +26,6 @@ export function GraphRunPage() {
   const stop = useMutation({ mutationFn: () => client.stopRun(runId), onSuccess: invalidate });
   const cont = useMutation({ mutationFn: () => client.continueRun(runId), onSuccess: invalidate });
   const retry = useMutation({ mutationFn: () => client.retryFailures(runId), onSuccess: invalidate });
-  const summary = useMutation({ mutationFn: ({ judge, entity }: { judge?: number | null; entity?: string }) => client.judgeSummary(runId, view, judge, entity || ""), onSuccess: invalidate });
 
   if (isLoading) return <p className="text-sm text-muted">Loading run...</p>;
   if (error || !data) return <p className="text-sm text-danger">{String(error || "Run not found")}</p>;
@@ -68,44 +65,7 @@ export function GraphRunPage() {
 
       <RunGraphPreview nodes={data.nodes} edges={data.edges} nodeProgress={data.node_progress} />
 
-      <section className="panel grid gap-4 p-4">
-        <div className="flex items-center justify-between gap-3">
-          <h2 className="text-sm font-bold">Leaderboards</h2>
-          <div className="flex gap-2">
-            {(["aggregate", "overall", "chain"] as LeaderboardView[]).map((option) => (
-              <Button key={option} type="button" variant={view === option ? "default" : "subtle"} onClick={() => setParams({ leaderboard_view: option })}>
-                {option === "aggregate" ? "Aggregated for step" : option === "overall" ? "Aggregated across steps" : "Show chain"}
-              </Button>
-            ))}
-          </div>
-        </div>
-        {data.leaderboards.map((group) => (
-          <div key={`${group.title}-${group.judge_prompt_node_id ?? "overall"}`} className="grid gap-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold">{group.title}</h3>
-              <Button type="button" variant="subtle" onClick={() => summary.mutate({ judge: group.judge_prompt_node_id })}>Summarize</Button>
-            </div>
-            <DataTable>
-              <Table>
-                <thead className="border-b border-line bg-surface-muted text-xs text-muted">
-                  <tr><th className="p-2">Rank</th><th className="p-2">Model</th><th className="p-2">ELO</th><th className="p-2">W-L-T</th><th className="p-2">Avg tokens</th></tr>
-                </thead>
-                <tbody>
-                  {group.rows.map((row, index) => (
-                    <tr key={row.entity_key} className="border-b border-line last:border-0">
-                      <td className="p-2 text-muted">{index + 1}</td>
-                      <td className="p-2 font-semibold">{row.label}</td>
-                      <td className="p-2">{row.rating.toFixed(1)}</td>
-                      <td className="p-2">{row.wins}-{row.losses}-{row.ties}</td>
-                      <td className="p-2">{row.avg_tokens}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </Table>
-            </DataTable>
-          </div>
-        ))}
-      </section>
+      <LeaderboardsSection runId={runId} initialData={data} />
 
       {data.analyses.length ? (
         <section className="panel grid gap-3 p-4">
@@ -168,6 +128,74 @@ function RunGraphPreview({ nodes, edges, nodeProgress }: { nodes: GraphNodeDto[]
   );
 }
 
+function LeaderboardsSection({ runId, initialData }: { runId: number; initialData: GraphRunDetail }) {
+  const [view, setView] = useState<LeaderboardView>("aggregate");
+  const { data } = useQuery({
+    queryKey: ["graph-run-leaderboards", runId, view],
+    queryFn: () => client.graphRun(runId, view),
+    enabled: Number.isFinite(runId),
+    placeholderData: (previous) => previous ?? (view === "aggregate" ? initialData : undefined),
+    refetchInterval: (query) => query.state.data?.run.status === "running" ? 5000 : false
+  });
+  const summary = useMutation({
+    mutationFn: ({ judge, entity }: { judge?: number | null; entity?: string }) => client.judgeSummary(runId, view, judge, entity || ""),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["graph-run-leaderboards", runId] });
+      queryClient.invalidateQueries({ queryKey: ["graph-run", runId, "base"] });
+    }
+  });
+  const leaderboards = data?.leaderboards ?? [];
+
+  return (
+    <section className="panel grid gap-4 p-4">
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-sm font-bold">Leaderboards</h2>
+        <div className="inline-grid grid-cols-3 overflow-hidden rounded-lg border border-line bg-surface-muted p-1">
+          {(["aggregate", "overall", "chain"] as LeaderboardView[]).map((option) => (
+            <button
+              key={option}
+              type="button"
+              className={[
+                "min-h-9 whitespace-nowrap rounded-md px-3 text-sm font-bold transition",
+                view === option ? "bg-accent text-white shadow-sm" : "text-ink-soft hover:bg-surface hover:text-ink"
+              ].join(" ")}
+              onClick={() => setView(option)}
+            >
+              {option === "aggregate" ? "For step" : option === "overall" ? "Across steps" : "Chain"}
+            </button>
+          ))}
+        </div>
+      </div>
+      {leaderboards.map((group) => (
+        <div key={`${group.title}-${group.judge_prompt_node_id ?? "overall"}`} className="grid gap-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-bold">{group.title}</h3>
+            <Button type="button" variant="subtle" onClick={() => summary.mutate({ judge: group.judge_prompt_node_id })}>Summarize</Button>
+          </div>
+          <DataTable>
+            <Table>
+              <thead className="border-b border-line bg-surface-muted text-xs text-muted">
+                <tr><th className="p-2">Rank</th><th className="p-2">Model</th><th className="p-2">ELO</th><th className="p-2">W-L-T</th><th className="p-2">Avg tokens</th></tr>
+              </thead>
+              <tbody>
+                {group.rows.map((row, index) => (
+                  <tr key={row.entity_key} className="border-b border-line last:border-0">
+                    <td className="p-2 text-muted">{index + 1}</td>
+                    <td className="p-2 font-semibold">{row.label}</td>
+                    <td className="p-2">{row.rating.toFixed(1)}</td>
+                    <td className="p-2">{row.wins}-{row.losses}-{row.ties}</td>
+                    <td className="p-2">{row.avg_tokens}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </Table>
+          </DataTable>
+        </div>
+      ))}
+    </section>
+  );
+}
+
 function RunPreviewNode({ data }: { data: { node: GraphNodeDto; progress?: GraphProgress } }) {
   const node = data.node;
   const progress = data.progress || { total: 0, pending: 0, running: 0, complete: 0, failed: 0 };
@@ -219,6 +247,7 @@ const previewIcons = {
 
 function OutputBrowser({ invocations, nodes }: { invocations: GraphInvocationDto[]; nodes: GraphNodeDto[] }) {
   const [openId, setOpenId] = useState<number | null>(null);
+  const [openModels, setOpenModels] = useState<Set<string>>(new Set());
   const groups = useMemo(() => {
     const nodeById = new Map(nodes.map((node) => [node.id, node]));
     const map = new Map<string, Map<string, Map<string, GraphInvocationDto[]>>>();
@@ -247,13 +276,27 @@ function OutputBrowser({ invocations, nodes }: { invocations: GraphInvocationDto
               <h4 className="text-sm font-bold">{promptTitle}</h4>
               {[...modelGroups.entries()].map(([modelTitle, rows]) => (
                 <div key={modelTitle} className="grid gap-2 rounded-md border border-line bg-surface p-3">
-                  <div className="flex items-center justify-between gap-3">
-                    <h5 className="text-sm font-semibold">{modelTitle}</h5>
-                    <span className="text-xs text-muted">{rows.length} call{rows.length === 1 ? "" : "s"}</span>
-                  </div>
-                  {rows.map((invocation) => (
-                    <InvocationCard key={invocation.id} invocation={invocation} open={openId === invocation.id} onToggle={() => setOpenId(openId === invocation.id ? null : invocation.id)} />
-                  ))}
+                  <ModelGroupHeader
+                    modelTitle={modelTitle}
+                    rows={rows}
+                    open={openModels.has(modelGroupKey(role, promptTitle, modelTitle))}
+                    onToggle={() => {
+                      const key = modelGroupKey(role, promptTitle, modelTitle);
+                      setOpenModels((current) => {
+                        const next = new Set(current);
+                        if (next.has(key)) next.delete(key);
+                        else next.add(key);
+                        return next;
+                      });
+                    }}
+                  />
+                  {openModels.has(modelGroupKey(role, promptTitle, modelTitle)) ? (
+                    <div className="grid gap-2">
+                      {rows.map((invocation) => (
+                        <InvocationCard key={invocation.id} invocation={invocation} open={openId === invocation.id} onToggle={() => setOpenId(openId === invocation.id ? null : invocation.id)} />
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -262,6 +305,30 @@ function OutputBrowser({ invocations, nodes }: { invocations: GraphInvocationDto
       ))}
     </section>
   );
+}
+
+function ModelGroupHeader({ modelTitle, rows, open, onToggle }: { modelTitle: string; rows: GraphInvocationDto[]; open: boolean; onToggle: () => void }) {
+  const complete = rows.filter((row) => row.status === "complete").length;
+  const failed = rows.filter((row) => row.status === "failed").length;
+  const running = rows.filter((row) => row.status === "running").length;
+  return (
+    <button type="button" className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left hover:bg-surface-muted" onClick={onToggle}>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="w-4 text-center text-muted">{open ? "−" : "+"}</span>
+        <span className="truncate text-sm font-semibold">{modelTitle}</span>
+      </span>
+      <span className="flex shrink-0 items-center gap-3 text-xs text-muted">
+        <span>{rows.length} call{rows.length === 1 ? "" : "s"}</span>
+        {running ? <span>{running} running</span> : null}
+        {failed ? <span className="text-danger">{failed} failed</span> : null}
+        <span>{complete} complete</span>
+      </span>
+    </button>
+  );
+}
+
+function modelGroupKey(role: string, promptTitle: string, modelTitle: string) {
+  return `${role}::${promptTitle}::${modelTitle}`;
 }
 
 function InvocationCard({ invocation, open, onToggle }: { invocation: GraphInvocationDto; open: boolean; onToggle: () => void }) {
