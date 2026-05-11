@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
 import ReactFlow, { Background, Controls, type Edge, type Node, Position, Handle } from "reactflow";
-import { Database, FileText, Gavel, MessageSquare, RotateCcw, Settings, Square, StepForward } from "lucide-react";
+import { Database, FileText, Gavel, MessageSquare, RotateCcw, Star, Settings, Square, StepForward } from "lucide-react";
 import { client } from "../../api/client";
 import { queryClient } from "../../api/queries";
 import type { GraphInvocationDto, GraphNodeDto, GraphProgress, GraphRunDetail, LeaderboardView } from "../../api/types";
@@ -181,7 +181,21 @@ function LeaderboardsSection({ runId, initialData }: { runId: number; initialDat
                 {group.rows.map((row, index) => (
                   <tr key={row.entity_key} className="border-b border-line last:border-0">
                     <td className="p-2 text-muted">{index + 1}</td>
-                    <td className="p-2 font-semibold">{row.label}</td>
+                    <td className="p-2">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold">{row.label}</span>
+                        {row.favorites.map((favorite) => (
+                          <span
+                            key={favorite.id}
+                            className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent-soft px-2 py-0.5 text-[11px] font-bold text-accent"
+                            title={`${favorite.title} favored this entry most`}
+                          >
+                            <Star size={11} />
+                            {favorite.title}
+                          </span>
+                        ))}
+                      </div>
+                    </td>
                     <td className="p-2">{row.rating.toFixed(1)}</td>
                     <td className="p-2">{row.wins}-{row.losses}-{row.ties}</td>
                     <td className="p-2">{row.avg_tokens}</td>
