@@ -94,9 +94,12 @@ def start_graph_run_thread(graph_run_id: int, session_factory: SessionFactory) -
         return
 
     def target() -> None:
+        print(f"[graph run {graph_run_id}] Background worker thread starting.", flush=True)
         try:
             asyncio.run(execute_graph_native_run(graph_run_id, session_factory))
         except Exception as exc:
+            print(f"[graph run {graph_run_id}] Background worker crashed.", flush=True)
+            print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), flush=True)
             with session_factory() as session:
                 run = session.get(GraphRun, graph_run_id)
                 if run:
@@ -108,6 +111,8 @@ def start_graph_run_thread(graph_run_id: int, session_factory: SessionFactory) -
                         graph.status = GraphStatus.failed
                         session.add(graph)
                     session.commit()
+        finally:
+            print(f"[graph run {graph_run_id}] Background worker thread stopped.", flush=True)
 
     _start_thread(GRAPH_RUN_THREADS, graph_run_id, target)
 

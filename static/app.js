@@ -76,6 +76,9 @@ if (document.readyState === "loading") {
     bindGraphPreviewCanvas();
     bindDatasetSourceFields();
     bindReasoningFields();
+    bindPreserveScrollLinks();
+    bindLeaderboardViewLinks();
+    restorePreservedScroll();
   });
 } else {
   restoreDetailsState();
@@ -86,9 +89,110 @@ if (document.readyState === "loading") {
   bindGraphPreviewCanvas();
   bindDatasetSourceFields();
   bindReasoningFields();
+  bindPreserveScrollLinks();
+  bindLeaderboardViewLinks();
+  restorePreservedScroll();
 }
 
 window.addEventListener("beforeunload", saveAllCanvasViewports);
+
+if ("scrollRestoration" in history) {
+  history.scrollRestoration = "manual";
+}
+
+function preserveScrollKey(pathname = location.pathname) {
+  return `scroll:${pathname}`;
+}
+
+function bindPreserveScrollLinks() {
+  document.querySelectorAll("[data-preserve-scroll='true']").forEach((link) => {
+    if (link.dataset.preserveScrollBound === "true") return;
+    link.dataset.preserveScrollBound = "true";
+    const save = () => savePreservedScroll(link);
+    link.addEventListener("pointerdown", save);
+    link.addEventListener("mousedown", save);
+    link.addEventListener("touchstart", save, { passive: true });
+    link.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") save();
+    });
+    link.addEventListener("click", save);
+  });
+}
+
+function bindLeaderboardViewLinks() {
+  document.querySelectorAll(".leaderboard-view-toggle a[data-preserve-scroll='true']").forEach((link) => {
+    if (link.dataset.leaderboardViewBound === "true") return;
+    link.dataset.leaderboardViewBound = "true";
+    link.addEventListener("click", async (event) => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button) return;
+      event.preventDefault();
+      savePreservedScroll(link);
+      const section = link.closest("[data-leaderboard-section='true']");
+      if (!section) {
+        window.location.href = link.href;
+        return;
+      }
+      const scrollTop = window.scrollY;
+      section.classList.add("is-loading");
+      try {
+        const response = await fetch(link.href, {
+          method: "GET",
+          headers: { "Cache-Control": "no-store" },
+        });
+        const html = await response.text();
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        const nextSection = doc.querySelector("[data-leaderboard-section='true']");
+        if (!nextSection) {
+          window.location.href = link.href;
+          return;
+        }
+        section.replaceWith(nextSection);
+        history.pushState({}, "", link.href);
+        bindAnalysisForms();
+        bindPreserveScrollLinks();
+        bindLeaderboardViewLinks();
+        window.scrollTo(window.scrollX, scrollTop);
+      } catch (_error) {
+        window.location.href = link.href;
+      } finally {
+        const currentSection = document.querySelector("[data-leaderboard-section='true']");
+        if (currentSection) currentSection.classList.remove("is-loading");
+      }
+    });
+  });
+}
+
+function savePreservedScroll(link) {
+  const href = link.getAttribute("href") || "";
+  let pathname = location.pathname;
+  try {
+    pathname = new URL(href, location.href).pathname;
+  } catch (_error) {
+    pathname = location.pathname;
+  }
+  sessionStorage.setItem(preserveScrollKey(pathname), String(window.scrollY));
+}
+
+function restorePreservedScroll() {
+  const key = preserveScrollKey();
+  const saved = sessionStorage.getItem(key);
+  if (saved === null) return;
+  const top = parseInt(saved, 10);
+  if (Number.isNaN(top)) return;
+  const restore = () => window.scrollTo(window.scrollX, top);
+  restore();
+  requestAnimationFrame(() => {
+    restore();
+    requestAnimationFrame(restore);
+  });
+  window.addEventListener("load", () => {
+    restore();
+    window.setTimeout(() => {
+      restore();
+      sessionStorage.removeItem(key);
+    }, 100);
+  }, { once: true });
+}
 
 function bindGraphPreviewCanvas() {
   document.querySelectorAll("[data-graph-canvas='view']").forEach((canvas) => {

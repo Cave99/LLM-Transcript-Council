@@ -37,10 +37,12 @@ from council.graphs import (
     update_node_position,
 )
 from council.graph_runtime import (
+    continue_graph_native_run,
     create_graph_native_run,
     graph_native_progress,
     graph_run_leaderboard,
     graph_run_leaderboards,
+    retry_graph_native_failures,
     stop_graph_native_run,
 )
 from council.jobs import start_graph_analysis_thread, start_graph_run_thread
@@ -59,10 +61,12 @@ from council.runner import create_project, delete_project, rename_project
 load_dotenv()
 init_db()
 
+ASSET_VERSION = "20260511-1"
+
 app, rt = fast_app(
     hdrs=(
         Link(rel="stylesheet", href="/static/app.css"),
-        Script(src="/static/app.js"),
+        Script(src=f"/static/app.js?v={ASSET_VERSION}"),
     )
 )
 
@@ -79,7 +83,7 @@ def shell(title: str, *content):
         Head(
             Title(f"{title} - LLM-Transcript-Council"),
             Link(rel="stylesheet", href="/static/app.css"),
-            Script(src="/static/app.js"),
+            Script(src=f"/static/app.js?v={ASSET_VERSION}"),
         ),
         Body(
             Div(
@@ -733,7 +737,7 @@ def get(graph_run_id: int, leaderboard_view: str = "aggregate"):
         plan = plan_graph(db, graph.id)
         nodes = {node.id: node for node in graph_node_list}
         node_progress = graph_node_progress(graph_node_list, invocations)
-        leaderboard_view = "chain" if leaderboard_view == "chain" else "aggregate"
+        leaderboard_view = leaderboard_view if leaderboard_view in {"aggregate", "chain", "overall"} else "aggregate"
         leaderboard_groups = graph_run_leaderboards(db, graph_run_id, graph_node_list, view_mode=leaderboard_view)
         leaderboard = leaderboard_groups[0]["rows"] if leaderboard_groups else []
         analyses = db.exec(
@@ -748,6 +752,8 @@ def get(graph_run_id: int, leaderboard_view: str = "aggregate"):
                 Div(
                     status_pill(graph_run.status.value),
                     run_action_button(graph_run, "Stop Run", f"/graph-runs/{graph_run.id}/stop", subtle=True) if graph_run.status == Status.running else "",
+                    run_action_button(graph_run, "Continue Run", f"/graph-runs/{graph_run.id}/continue") if graph_run.status in {Status.paused, Status.pending, Status.failed} or (graph_run.status == Status.complete and progress["pending"]) else "",
+                    run_action_button(graph_run, "Retry Failures", f"/graph-runs/{graph_run.id}/retry-failures") if graph_run.status == Status.complete and progress["failed"] else "",
                     A("Graph", href=f"/graphs/{graph.id}", cls="button subtle"),
                     cls="actions",
                 ),
@@ -769,6 +775,7 @@ def get(graph_run_id: int, leaderboard_view: str = "aggregate"):
                 for group in leaderboard_display_groups(leaderboard_groups)
             ],
             cls="section panel",
+            data_leaderboard_section="true",
         ),
         Section(
             H2("Model Outputs"),
@@ -787,6 +794,26 @@ def post(graph_run_id: int):
     return RedirectResponse(f"/graph-runs/{graph_run_id}", status_code=303)
 
 
+@rt("/graph-runs/{graph_run_id}/continue")
+def post(graph_run_id: int):
+    """Resume a paused, pending, or failed graph-native run."""
+
+    with session() as db:
+        continue_graph_native_run(db, graph_run_id)
+    start_graph_run_thread(graph_run_id, session)
+    return RedirectResponse(f"/graph-runs/{graph_run_id}", status_code=303)
+
+
+@rt("/graph-runs/{graph_run_id}/retry-failures")
+def post(graph_run_id: int):
+    """Requeue failed graph invocations and resume the graph run."""
+
+    with session() as db:
+        retry_graph_native_failures(db, graph_run_id)
+    start_graph_run_thread(graph_run_id, session)
+    return RedirectResponse(f"/graph-runs/{graph_run_id}", status_code=303)
+
+
 @rt("/graph-runs/{graph_run_id}/judge-summary")
 def post(graph_run_id: int, judge_prompt_node_id: str = "", leaderboard_view: str = "aggregate", top_entity_key: str = ""):
     """Start a background judge-summary job for a graph run."""
@@ -799,7 +826,7 @@ def post(graph_run_id: int, judge_prompt_node_id: str = "", leaderboard_view: st
         leaderboard_view=leaderboard_view,
         top_entity_key=top_entity_key,
     )
-    view = "chain" if leaderboard_view == "chain" else "aggregate"
+    view = leaderboard_view if leaderboard_view in {"aggregate", "chain", "overall"} else "aggregate"
     return RedirectResponse(f"/graph-runs/{graph_run_id}?leaderboard_view={view}", status_code=303)
 
 
@@ -1509,11 +1536,19 @@ def leaderboard_view_controls(graph_run_id: int, view_mode: str):
             "Aggregated for step",
             href=f"/graph-runs/{graph_run_id}?leaderboard_view=aggregate",
             cls="button subtle is-active" if view_mode == "aggregate" else "button subtle",
+            data_preserve_scroll="true",
+        ),
+        A(
+            "Aggregated across steps",
+            href=f"/graph-runs/{graph_run_id}?leaderboard_view=overall",
+            cls="button subtle is-active" if view_mode == "overall" else "button subtle",
+            data_preserve_scroll="true",
         ),
         A(
             "Show chain",
             href=f"/graph-runs/{graph_run_id}?leaderboard_view=chain",
             cls="button subtle is-active" if view_mode == "chain" else "button subtle",
+            data_preserve_scroll="true",
         ),
         cls="leaderboard-view-toggle",
     )
@@ -1522,6 +1557,8 @@ def leaderboard_view_controls(graph_run_id: int, view_mode: str):
 def leaderboard_display_groups(groups: list[dict]) -> list[dict]:
     """Show judge-round leaderboards without duplicating the aggregate board."""
 
+    if groups and groups[0].get("view_mode") == "overall":
+        return [groups[0]]
     scoped = [group for group in groups if group["title"] != "Overall"]
     return scoped or groups
 

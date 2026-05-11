@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,6 +91,61 @@ def stop_graph_native_run(session, graph_run_id: int) -> GraphRun:
     return run
 
 
+def continue_graph_native_run(session, graph_run_id: int) -> GraphRun:
+    """Mark a resumable graph run ready for the background worker."""
+
+    run = session.get(GraphRun, graph_run_id)
+    if not run:
+        raise ValueError(f"Graph run {graph_run_id} does not exist")
+    prune_orphaned_graph_failures(session, graph_run_id)
+    run.status = Status.pending
+    run.error = None
+    run.completed_at = None
+    session.add(run)
+    _sync_graph_status(session, run)
+    session.commit()
+    session.refresh(run)
+    return run
+
+
+def retry_graph_native_failures(session, graph_run_id: int) -> GraphRun:
+    """Requeue failed graph invocations while preserving completed work."""
+
+    run = session.get(GraphRun, graph_run_id)
+    if not run:
+        raise ValueError(f"Graph run {graph_run_id} does not exist")
+
+    prune_orphaned_graph_failures(session, graph_run_id)
+    failed_invocations = session.exec(
+        select(GraphInvocation).where(
+            GraphInvocation.graph_run_id == graph_run_id,
+            GraphInvocation.status == Status.failed,
+        )
+    ).all()
+    for invocation in failed_invocations:
+        invocation.status = Status.pending
+        invocation.error = None
+        invocation.output_raw = None
+        invocation.output_json = None
+        invocation.prompt_tokens = None
+        invocation.completion_tokens = None
+        invocation.duration_seconds = None
+        invocation.output_tokens_per_second = None
+        invocation.cost = None
+        invocation.started_at = None
+        invocation.completed_at = None
+        session.add(invocation)
+
+    run.status = Status.pending
+    run.error = None
+    run.completed_at = None
+    session.add(run)
+    _sync_graph_status(session, run)
+    session.commit()
+    session.refresh(run)
+    return run
+
+
 async def execute_graph_native_run(graph_run_id: int, session_factory, client: OpenRouterClient | None = None) -> None:
     """Run chained prompt stages over each dataset item and model node."""
 
@@ -112,6 +168,7 @@ async def execute_graph_native_run(graph_run_id: int, session_factory, client: O
         session.add(run)
         session.commit()
         max_concurrency = run.max_concurrency
+        progress = graph_native_progress(session, graph_run_id)
         nodes = [_runtime_node(node) for node in graph_nodes(session, run.graph_id)]
         edges = [_runtime_edge(edge) for edge in graph_edges(session, run.graph_id)]
         items = dataset_items(nodes)
@@ -122,6 +179,12 @@ async def execute_graph_native_run(graph_run_id: int, session_factory, client: O
         model_nodes = [node for node in nodes if node.kind == "model" and config(node).get("role") == "generator" and config(node).get("model_id", "").strip()]
         judge_models = [node for node in nodes if node.kind == "model" and config(node).get("role") == "judge" and config(node).get("model_id", "").strip()]
         constants = {config(node).get("socket", node.title): node.body for node in nodes if node.kind == "constant"}
+        print(
+            f"[graph run {graph_run_id}] Worker started: "
+            f"{progress['complete']}/{progress['total']} complete, "
+            f"{progress['pending']} pending, {progress['failed']} failed.",
+            flush=True,
+        )
         preflight_error = _graph_preflight_error(items, prompt_stages, model_nodes, judge_prompts, judge_models)
         if preflight_error:
             run.status = Status.failed
@@ -199,13 +262,79 @@ async def execute_graph_native_run(graph_run_id: int, session_factory, client: O
             await asyncio.gather(*tasks)
 
     with session_factory() as session:
-        run = session.get(GraphRun, graph_run_id)
-        if run and run.status != Status.paused:
-            run.status = Status.complete
-            run.completed_at = utc_now()
-            session.add(run)
-            _sync_graph_status(session, run)
-            session.commit()
+        finish_graph_native_run(session, graph_run_id)
+
+
+def finish_graph_native_run(session, graph_run_id: int) -> GraphRun | None:
+    """Finalize a graph run only when no invocation rows remain unfinished."""
+
+    run = session.get(GraphRun, graph_run_id)
+    if not run or run.status == Status.paused:
+        return run
+    progress = graph_native_progress(session, graph_run_id)
+    if progress["pending"] or progress["running"]:
+        stale_count = prune_unfinished_graph_invocations(session, graph_run_id)
+        if stale_count:
+            print(f"[graph run {graph_run_id}] Pruned {stale_count} stale unfinished invocation rows.", flush=True)
+        progress = graph_native_progress(session, graph_run_id)
+    if progress["pending"] or progress["running"]:
+        run.status = Status.pending
+        run.completed_at = None
+    else:
+        run.status = Status.complete
+        run.completed_at = utc_now()
+    session.add(run)
+    _sync_graph_status(session, run)
+    session.commit()
+    session.refresh(run)
+    final_progress = graph_native_progress(session, graph_run_id)
+    print(
+        f"[graph run {graph_run_id}] Worker finished with status={run.status.value}: "
+        f"{final_progress['complete']}/{final_progress['total']} complete, "
+        f"{final_progress['pending']} pending, {final_progress['failed']} failed.",
+        flush=True,
+    )
+    return run
+
+
+def prune_unfinished_graph_invocations(session, graph_run_id: int) -> int:
+    """Remove pending rows left behind by older topology or target-stage plans."""
+
+    stale_rows = session.exec(
+        select(GraphInvocation)
+        .where(GraphInvocation.graph_run_id == graph_run_id)
+        .where(GraphInvocation.status.in_([Status.pending, Status.running]))
+    ).all()
+    for invocation in stale_rows:
+        print(
+            f"[graph run {graph_run_id}] STALE INVOCATION PRUNED: "
+            f"node_id={invocation.node_id} model_node_id={invocation.model_node_id} item={invocation.item_key!r}",
+            flush=True,
+        )
+        session.delete(invocation)
+    session.flush()
+    return len(stale_rows)
+
+
+def prune_orphaned_graph_failures(session, graph_run_id: int) -> int:
+    """Remove synthetic orphaned failures produced by older resume attempts."""
+
+    marker = "Worker exited without reaching this invocation"
+    stale_rows = session.exec(
+        select(GraphInvocation)
+        .where(GraphInvocation.graph_run_id == graph_run_id)
+        .where(GraphInvocation.status == Status.failed)
+        .where(GraphInvocation.error.like(f"{marker}%"))
+    ).all()
+    for invocation in stale_rows:
+        print(
+            f"[graph run {graph_run_id}] STALE ORPHANED FAILURE PRUNED: "
+            f"node_id={invocation.node_id} model_node_id={invocation.model_node_id} item={invocation.item_key!r}",
+            flush=True,
+        )
+        session.delete(invocation)
+    session.flush()
+    return len(stale_rows)
 
 
 def dataset_items(nodes: list[GraphNode | RuntimeNode]) -> list[DatasetItem]:
@@ -454,6 +583,7 @@ async def _run_invocation(
         if unresolved:
             invocation.status = Status.failed
             invocation.error = f"Unresolved prompt inputs after edge rendering: {', '.join(unresolved)}"
+            _log_invocation_failure("generator", graph_run_id, prompt.title, model.title, item_key, invocation.error)
             invocation.completed_at = utc_now()
             session.add(invocation)
             session.commit()
@@ -491,10 +621,12 @@ async def _run_invocation(
             session.commit()
         return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output=repaired if prompt_cfg.get("upstream_mode") == "json" else response.text, prompt_id=prompt.id, stage_index=stage_index)
     except Exception as exc:
+        error = str(exc)
+        _log_invocation_failure("generator", graph_run_id, prompt.title, model.title, item_key, error, exc)
         with session_factory() as session:
             invocation = session.get(GraphInvocation, invocation_id)
             invocation.status = Status.failed
-            invocation.error = str(exc)
+            invocation.error = error
             invocation.completed_at = utc_now()
             session.add(invocation)
             session.commit()
@@ -550,6 +682,7 @@ async def _run_judge_invocation(
         if unresolved:
             invocation.status = Status.failed
             invocation.error = f"Unresolved judge prompt inputs after edge rendering: {', '.join(unresolved)}"
+            _log_invocation_failure("judge", graph_run_id, judge_prompt.title, judge_model.title, item_key, invocation.error)
             invocation.completed_at = utc_now()
             session.add(invocation)
             session.commit()
@@ -585,13 +718,35 @@ async def _run_judge_invocation(
             session.add(invocation)
             session.commit()
     except Exception as exc:
+        error = str(exc)
+        _log_invocation_failure("judge", graph_run_id, judge_prompt.title, judge_model.title, item_key, error, exc)
         with session_factory() as session:
             invocation = session.get(GraphInvocation, invocation_id)
             invocation.status = Status.failed
-            invocation.error = str(exc)
+            invocation.error = error
             invocation.completed_at = utc_now()
             session.add(invocation)
             session.commit()
+
+
+def _log_invocation_failure(
+    kind: str,
+    graph_run_id: int,
+    prompt_title: str,
+    model_title: str,
+    item_key: str,
+    error: str,
+    exc: Exception | None = None,
+) -> None:
+    """Print invocation failures where local run operators can see them."""
+
+    print(
+        f"[graph run {graph_run_id}] INVOCATION FAILED: "
+        f"kind={kind} prompt={prompt_title!r} model={model_title!r} item={item_key!r}: {error}",
+        flush=True,
+    )
+    if exc:
+        print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), flush=True)
 
 
 def _markdown_items(cfg: dict) -> list[DatasetItem]:
@@ -685,6 +840,7 @@ def graph_run_leaderboards(session, graph_run_id: int, nodes: list[GraphNode], *
         {
             "title": title,
             "judge_prompt_node_id": judge_prompt_id,
+            "view_mode": view_mode,
             "rows": _leaderboard_rows_for_invocations(scoped, model_lookup, judge_nodes, token_totals, view_mode=view_mode, target_depth=target_depths.get(judge_prompt_id) if judge_prompt_id else None),
         }
         for title, judge_prompt_id, scoped in groups
@@ -786,7 +942,7 @@ def _parse_judge_pair(item_key: str) -> tuple[str, str] | None:
 
 def _display_entities(pair: tuple[str, str], view_mode: str, target_depth: int | None) -> tuple[str, str]:
     pair = (_truncate_entity(pair[0], target_depth), _truncate_entity(pair[1], target_depth))
-    if view_mode == "chain":
+    if view_mode in {"chain", "overall"}:
         return pair
     return _entity_final_model(pair[0]), _entity_final_model(pair[1])
 

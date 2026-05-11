@@ -120,7 +120,7 @@ async def generate_graph_run_judge_summary(
             session.commit()
             return
         nodes = graph_nodes(session, graph_run.graph_id)
-        leaderboard_view = "chain" if leaderboard_view == "chain" else "aggregate"
+        leaderboard_view = leaderboard_view if leaderboard_view in {"aggregate", "chain", "overall"} else "aggregate"
         groups = graph_run_leaderboards(session, graph_run_id, nodes, view_mode=leaderboard_view)
         group = next((g for g in groups if g.get("judge_prompt_node_id") == judge_prompt_node_id), None) or groups[0]
         leaderboard = group["rows"]

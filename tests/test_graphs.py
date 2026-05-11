@@ -3,7 +3,7 @@ import asyncio
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from council.analysis import generate_graph_run_judge_summary, sample_graph_judge_reasoning_traces
-from council.graph_runtime import create_graph_native_run, dataset_items, execute_graph_native_run, graph_run_leaderboards
+from council.graph_runtime import continue_graph_native_run, create_graph_native_run, dataset_items, execute_graph_native_run, finish_graph_native_run, graph_run_leaderboards, prune_orphaned_graph_failures, retry_graph_native_failures
 from council.graphs import add_constant_node, add_dataset_node, add_judge_node, add_model_node, add_prompt_node, create_edge, create_graph, graph_edges, graph_nodes, launch_graph_run, plan_graph, update_node, update_node_position
 from council.models import Generation, GeneratorConfig, GraphInvocation, GraphNode, GraphRunAnalysis, JudgeConfig, Match, Project, Run, Status, Transcript
 from council.openrouter import LLMResponse
@@ -281,6 +281,182 @@ def test_graph_native_run_fans_out_downstream_outputs_by_item_branch(tmp_path):
         assert all("hello transcript" in row.rendered_prompt for row in second_stage)
 
 
+def test_retry_graph_native_failures_requeues_only_failed_invocations(tmp_path):
+    """Retrying failures should keep completed evidence and make failed calls runnable."""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'graph-runtime-retry.db'}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        project = create_project(session, "demo")
+        graph = create_graph(session, project.id, "graph")
+        prompt = add_prompt_node(session, graph.id, title="Prompt")
+        model = add_model_node(session, graph.id, title="A", model_id="model-a", role="generator")
+        graph_run = create_graph_native_run(session, graph.id, max_concurrency=1, sample_size=1)
+        graph_run.status = Status.complete
+        graph_run.error = "some calls failed"
+        graph_run.completed_at = project.created_at
+        session.add(graph_run)
+        complete = GraphInvocation(
+            graph_run_id=graph_run.id,
+            node_id=prompt.id,
+            model_node_id=model.id,
+            item_key="call_01",
+            status=Status.complete,
+            output_raw="kept",
+            completed_at=project.created_at,
+        )
+        failed = GraphInvocation(
+            graph_run_id=graph_run.id,
+            node_id=prompt.id,
+            model_node_id=model.id,
+            item_key="call_02",
+            status=Status.failed,
+            output_raw="stale",
+            error="rate limited",
+            prompt_tokens=10,
+            completion_tokens=5,
+            duration_seconds=1.2,
+            completed_at=project.created_at,
+        )
+        session.add(complete)
+        session.add(failed)
+        session.commit()
+        complete_id = complete.id
+        failed_id = failed.id
+        graph_run_id = graph_run.id
+
+        retry_graph_native_failures(session, graph_run_id)
+
+        refreshed_run = session.get(type(graph_run), graph_run_id)
+        refreshed_complete = session.get(GraphInvocation, complete_id)
+        refreshed_failed = session.get(GraphInvocation, failed_id)
+        assert refreshed_run.status == Status.pending
+        assert refreshed_run.error is None
+        assert refreshed_run.completed_at is None
+        assert refreshed_complete.status == Status.complete
+        assert refreshed_complete.output_raw == "kept"
+        assert refreshed_failed.status == Status.pending
+        assert refreshed_failed.error is None
+        assert refreshed_failed.output_raw is None
+        assert refreshed_failed.prompt_tokens is None
+        assert refreshed_failed.completed_at is None
+
+
+def test_continue_graph_native_run_reopens_paused_run(tmp_path):
+    """Continuing a paused run should make it schedulable without clearing evidence."""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'graph-runtime-continue.db'}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        project = create_project(session, "demo")
+        graph = create_graph(session, project.id, "graph")
+        prompt = add_prompt_node(session, graph.id, title="Prompt")
+        model = add_model_node(session, graph.id, title="A", model_id="model-a", role="generator")
+        graph_run = create_graph_native_run(session, graph.id, max_concurrency=1, sample_size=1)
+        graph_run.status = Status.paused
+        graph_run.error = "stopped"
+        graph_run.completed_at = project.created_at
+        complete = GraphInvocation(
+            graph_run_id=graph_run.id,
+            node_id=prompt.id,
+            model_node_id=model.id,
+            item_key="call_01",
+            status=Status.complete,
+            output_raw="kept",
+        )
+        session.add(graph_run)
+        session.add(complete)
+        session.commit()
+        graph_run_id = graph_run.id
+        complete_id = complete.id
+
+        continue_graph_native_run(session, graph_run_id)
+
+        refreshed_run = session.get(type(graph_run), graph_run_id)
+        refreshed_complete = session.get(GraphInvocation, complete_id)
+        assert refreshed_run.status == Status.pending
+        assert refreshed_run.error is None
+        assert refreshed_run.completed_at is None
+        assert refreshed_complete.status == Status.complete
+        assert refreshed_complete.output_raw == "kept"
+
+
+def test_finish_graph_native_run_prunes_unreached_pending_invocations(tmp_path):
+    """A worker pass should remove old pending rows that are no longer schedulable."""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'graph-runtime-finish.db'}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        project = create_project(session, "demo")
+        graph = create_graph(session, project.id, "graph")
+        prompt = add_prompt_node(session, graph.id, title="Prompt")
+        model = add_model_node(session, graph.id, title="A", model_id="model-a", role="generator")
+        graph_run = create_graph_native_run(session, graph.id, max_concurrency=1, sample_size=1)
+        graph_run.status = Status.running
+        pending = GraphInvocation(
+            graph_run_id=graph_run.id,
+            node_id=prompt.id,
+            model_node_id=model.id,
+            item_key="call_01",
+            status=Status.pending,
+        )
+        session.add(graph_run)
+        session.add(pending)
+        session.commit()
+        graph_run_id = graph_run.id
+
+        finish_graph_native_run(session, graph_run_id)
+
+        refreshed_run = session.get(type(graph_run), graph_run_id)
+        assert refreshed_run.status == Status.complete
+        assert refreshed_run.completed_at is not None
+        assert session.get(GraphInvocation, pending.id) is None
+
+
+def test_prune_orphaned_graph_failures_removes_synthetic_resume_failures(tmp_path):
+    """Synthetic orphan failures should not count as real judge failures."""
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'graph-runtime-orphan-prune.db'}", connect_args={"check_same_thread": False})
+    SQLModel.metadata.create_all(engine)
+
+    with Session(engine) as session:
+        project = create_project(session, "demo")
+        graph = create_graph(session, project.id, "graph")
+        prompt = add_prompt_node(session, graph.id, title="Prompt")
+        model = add_model_node(session, graph.id, title="A", model_id="model-a", role="generator")
+        graph_run = create_graph_native_run(session, graph.id, max_concurrency=1, sample_size=1)
+        orphaned = GraphInvocation(
+            graph_run_id=graph_run.id,
+            node_id=prompt.id,
+            model_node_id=model.id,
+            item_key="call_01",
+            status=Status.failed,
+            error="Worker exited without reaching this invocation. It may depend on an upstream output.",
+        )
+        real_failure = GraphInvocation(
+            graph_run_id=graph_run.id,
+            node_id=prompt.id,
+            model_node_id=model.id,
+            item_key="call_02",
+            status=Status.failed,
+            error="OpenRouter call failed after retries",
+        )
+        session.add(orphaned)
+        session.add(real_failure)
+        session.commit()
+        orphaned_id = orphaned.id
+        real_failure_id = real_failure.id
+
+        pruned = prune_orphaned_graph_failures(session, graph_run.id)
+
+        assert pruned == 1
+        assert session.get(GraphInvocation, orphaned_id) is None
+        assert session.get(GraphInvocation, real_failure_id) is not None
+
+
 def test_graph_runtime_scopes_models_by_prompt_edges(tmp_path):
     """Runtime should use only the generator models connected to each prompt stage."""
 
@@ -437,9 +613,13 @@ def test_graph_leaderboard_view_can_aggregate_or_show_chains(tmp_path):
 
         aggregate = graph_run_leaderboards(session, graph_run.id, graph_nodes(session, graph.id), view_mode="aggregate")[0]["rows"]
         chain = graph_run_leaderboards(session, graph_run.id, graph_nodes(session, graph.id), view_mode="chain")[0]["rows"]
+        overall_groups = graph_run_leaderboards(session, graph_run.id, graph_nodes(session, graph.id), view_mode="overall")
 
         assert {row["label"] for row in aggregate} == {"A", "B"}
         assert {row["label"] for row in chain} == {"A -> B", "B -> A"}
+        assert overall_groups[0]["title"] == "Overall"
+        assert overall_groups[0]["view_mode"] == "overall"
+        assert {row["label"] for row in overall_groups[0]["rows"]} == {"A -> B", "B -> A"}
 
 
 def test_leaderboard_truncates_stale_chain_keys_to_judge_target_stage(tmp_path):
