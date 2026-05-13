@@ -348,6 +348,40 @@ async def _run_generation_invocation(
     lineage_key = f"{input_branch.lineage_key}->{candidate.id}" if input_branch else candidate.id
     template = _prompt_text(candidate.prompt_path, candidate.prompt_inline)
     rendered = render_template(template, {**item.values, **constants, "previous_output": previous_output})
+    prepared = _prepare_generation_invocation(session_factory, graph_run_id, stage_index, stage, candidate, item, lineage_key, rendered)
+    if prepared is None:
+        return None
+    if isinstance(prepared, OutputBranch):
+        return prepared
+    invocation_id = prepared
+    try:
+        async with semaphore:
+            started = time.perf_counter()
+            response = await client.chat(model=candidate.model, temperature=candidate.params.temperature, reasoning_effort=candidate.params.reasoning_effort, retries=candidate.params.retry_count, messages=[{"role": "user", "content": rendered}])
+            duration = max(time.perf_counter() - started, 0.001)
+        repaired = maybe_repair_json(response.text)
+        output_text = response.text
+        output_json = repaired
+        if stage.upstream_output == "json":
+            try:
+                parsed = parse_json_object(repaired)
+            except Exception as exc:  # noqa: BLE001
+                _fail_invocation(session_factory, invocation_id, f"Invalid JSON output for {stage.id}: {exc}", "invalid_json_output", output_raw=response.text, output_json=repaired)
+                print(f"[graph run {graph_run_id}] invalid JSON output: {response.text}", flush=True)
+                return None
+            output_json = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+            output_text = output_json
+        _complete_invocation(session_factory, invocation_id, response, output_json, duration)
+        return OutputBranch(item=item, stage_id=stage.id, candidate_id=candidate.id, candidate_title=candidate.title or candidate.id, lineage_key=lineage_key, output=output_text, invocation_id=invocation_id)
+    except Exception as exc:  # noqa: BLE001
+        _fail_invocation(session_factory, invocation_id, str(exc), _error_category(exc))
+        print(f"[graph run {graph_run_id}] generation failed: {traceback.format_exc()}", flush=True)
+        return None
+
+
+def _prepare_generation_invocation(session_factory, graph_run_id: int, stage_index: int, stage: StageSpec, candidate: CandidateSpec, item: DatasetItem, lineage_key: str, rendered: str) -> int | OutputBranch | None:
+    """Create or reuse the persisted generation evidence row."""
+
     unresolved = _unresolved_inputs(rendered)
     with session_factory() as session:
         existing = session.exec(
@@ -361,15 +395,8 @@ async def _run_generation_invocation(
             )
         ).first()
         if existing and existing.status == Status.complete:
-            return OutputBranch(
-                item=item,
-                stage_id=stage.id,
-                candidate_id=candidate.id,
-                candidate_title=candidate.title or candidate.id,
-                lineage_key=lineage_key,
-                output=existing.output_json if stage.upstream_output == "json" and existing.output_json else existing.output_raw or "",
-                invocation_id=existing.id,
-            )
+            output = existing.output_json if stage.upstream_output == "json" and existing.output_json else existing.output_raw or ""
+            return OutputBranch(item=item, stage_id=stage.id, candidate_id=candidate.id, candidate_title=candidate.title or candidate.id, lineage_key=lineage_key, output=output, invocation_id=existing.id)
         invocation = existing or GraphInvocation(graph_run_id=graph_run_id, kind="generation", stage_id=stage.id, candidate_id=candidate.id, item_key=item.key, lineage_key=lineage_key, stage_index=stage_index, model_id=candidate.model)
         invocation.status = Status.running
         invocation.rendered_prompt = rendered
@@ -386,58 +413,7 @@ async def _run_generation_invocation(
         invocation.started_at = utc_now()
         session.add(invocation)
         session.commit()
-        invocation_id = invocation.id
-    try:
-        async with semaphore:
-            started = time.perf_counter()
-            response = await client.chat(model=candidate.model, temperature=candidate.params.temperature, reasoning_effort=candidate.params.reasoning_effort, retries=candidate.params.retry_count, messages=[{"role": "user", "content": rendered}])
-            duration = max(time.perf_counter() - started, 0.001)
-        repaired = maybe_repair_json(response.text)
-        output_text = response.text
-        output_json = repaired
-        if stage.upstream_output == "json":
-            try:
-                parsed = parse_json_object(repaired)
-            except Exception as exc:  # noqa: BLE001
-                with session_factory() as session:
-                    invocation = session.get(GraphInvocation, invocation_id)
-                    invocation.status = Status.failed
-                    invocation.output_raw = response.text
-                    invocation.output_json = repaired
-                    invocation.error = f"Invalid JSON output for {stage.id}: {exc}"
-                    invocation.error_category = "invalid_json_output"
-                    invocation.completed_at = utc_now()
-                    session.add(invocation)
-                    session.commit()
-                print(f"[graph run {graph_run_id}] invalid JSON output: {response.text}", flush=True)
-                return None
-            output_json = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
-            output_text = output_json
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.complete
-            invocation.output_raw = response.text
-            invocation.output_json = output_json
-            invocation.prompt_tokens = response.prompt_tokens
-            invocation.completion_tokens = response.completion_tokens
-            invocation.duration_seconds = duration
-            invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
-            invocation.cost = response.cost
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-            return OutputBranch(item=item, stage_id=stage.id, candidate_id=candidate.id, candidate_title=candidate.title or candidate.id, lineage_key=lineage_key, output=output_text, invocation_id=invocation_id)
-    except Exception as exc:  # noqa: BLE001
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.failed
-            invocation.error = str(exc)
-            invocation.error_category = _error_category(exc)
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-        print(f"[graph run {graph_run_id}] generation failed: {traceback.format_exc()}", flush=True)
-        return None
+        return invocation.id
 
 
 def _ensure_pairs(session, graph_run_id: int, evaluator: EvaluatorSpec, outputs: list[OutputBranch]) -> list[GraphPair]:
@@ -484,22 +460,38 @@ def _ensure_pairs(session, graph_run_id: int, evaluator: EvaluatorSpec, outputs:
 
 
 async def _run_llm_judge_pair(graph_run_id: int, evaluator: EvaluatorSpec, pair_id: int, constants: dict[str, str], output_mode: str, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
+    prepared = _prepare_judge_invocation(session_factory, graph_run_id, evaluator, pair_id, constants, output_mode)
+    if not prepared:
+        return
+    invocation_id, rendered = prepared
+    try:
+        async with semaphore:
+            started = time.perf_counter()
+            response = await client.chat(model=evaluator.model, temperature=evaluator.params.temperature, reasoning_effort=evaluator.params.reasoning_effort, retries=evaluator.params.retry_count, messages=[{"role": "user", "content": rendered}])
+            duration = max(time.perf_counter() - started, 0.001)
+        parsed = parse_json_object(response.text)
+        winner = _normalized_winner(parsed.get(evaluator.output.winner_key, "TIE"))
+        reasoning = str(parsed.get(evaluator.output.reasoning_key, "")).strip()
+        _complete_judge_invocation(session_factory, invocation_id, pair_id, winner, reasoning, response, duration)
+    except Exception as exc:  # noqa: BLE001
+        _fail_invocation(session_factory, invocation_id, str(exc), _error_category(exc))
+        print(f"[graph run {graph_run_id}] judge failed: {traceback.format_exc()}", flush=True)
+
+
+def _prepare_judge_invocation(session_factory, graph_run_id: int, evaluator: EvaluatorSpec, pair_id: int, constants: dict[str, str], output_mode: str) -> tuple[int, str] | None:
+    """Create one judge invocation when the pair still needs an LLM vote."""
+
     with session_factory() as session:
         pair = session.get(GraphPair, pair_id)
         if not pair or pair.status == Status.complete:
-            return
+            return None
         a_invocation = session.get(GraphInvocation, pair.a_invocation_id)
         b_invocation = session.get(GraphInvocation, pair.b_invocation_id)
-        if not a_invocation or not b_invocation:
+        if not a_invocation or not b_invocation or (output_mode == "json" and (not a_invocation.output_json or not b_invocation.output_json)):
             pair.status = Status.failed
             session.add(pair)
             session.commit()
-            return
-        if output_mode == "json" and (not a_invocation.output_json or not b_invocation.output_json):
-            pair.status = Status.failed
-            session.add(pair)
-            session.commit()
-            return
+            return None
         values = {
             **constants,
             "output_a": a_invocation.output_json if output_mode == "json" else a_invocation.output_raw or "",
@@ -509,56 +501,75 @@ async def _run_llm_judge_pair(graph_run_id: int, evaluator: EvaluatorSpec, pair_
             "lineage_a": pair.a_lineage_key,
             "lineage_b": pair.b_lineage_key,
         }
-        template = _prompt_text(evaluator.prompt_path, evaluator.prompt_inline)
-        rendered = render_template(template, values)
+        rendered = render_template(_prompt_text(evaluator.prompt_path, evaluator.prompt_inline), values)
         existing_judgement = session.exec(select(GraphJudgement).where(GraphJudgement.pair_id == pair_id, GraphJudgement.evaluator_type == "llm_pairwise")).first()
         if existing_judgement and existing_judgement.winner:
             pair.status = Status.complete
             session.add(pair)
             session.commit()
-            return
+            return None
         invocation = GraphInvocation(graph_run_id=graph_run_id, kind="llm_judge", stage_id=evaluator.target_stage, evaluator_id=evaluator.id, item_key=pair.item_key, lineage_key=pair.pair_key, stage_index=10_000, model_id=evaluator.model, rendered_prompt=rendered, status=Status.running, started_at=utc_now())
         session.add(invocation)
         session.commit()
-        invocation_id = invocation.id
-    try:
-        async with semaphore:
-            started = time.perf_counter()
-            response = await client.chat(model=evaluator.model, temperature=evaluator.params.temperature, reasoning_effort=evaluator.params.reasoning_effort, retries=evaluator.params.retry_count, messages=[{"role": "user", "content": rendered}])
-            duration = max(time.perf_counter() - started, 0.001)
-        parsed = parse_json_object(response.text)
-        winner = str(parsed.get(evaluator.output.winner_key, "TIE")).upper()
-        if winner not in {"A", "B", "TIE"}:
-            winner = "TIE"
-        reasoning = str(parsed.get(evaluator.output.reasoning_key, "")).strip()
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.complete
-            invocation.output_raw = response.text
-            invocation.output_json = maybe_repair_json(response.text)
-            invocation.prompt_tokens = response.prompt_tokens
-            invocation.completion_tokens = response.completion_tokens
-            invocation.duration_seconds = duration
-            invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
-            invocation.cost = response.cost
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            judgement = GraphJudgement(pair_id=pair_id, evaluator_type="llm_pairwise", judge_invocation_id=invocation_id, winner=winner, reasoning=reasoning)
-            pair = session.get(GraphPair, pair_id)
-            pair.status = Status.complete
-            session.add(pair)
-            session.add(judgement)
-            session.commit()
-    except Exception as exc:  # noqa: BLE001
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.failed
-            invocation.error = str(exc)
-            invocation.error_category = _error_category(exc)
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-        print(f"[graph run {graph_run_id}] judge failed: {traceback.format_exc()}", flush=True)
+        return invocation.id, rendered
+
+
+def _complete_invocation(session_factory, invocation_id: int, response, output_json: str, duration: float) -> None:
+    """Persist common successful model-call metadata."""
+
+    with session_factory() as session:
+        invocation = session.get(GraphInvocation, invocation_id)
+        invocation.status = Status.complete
+        invocation.output_raw = response.text
+        invocation.output_json = output_json
+        invocation.prompt_tokens = response.prompt_tokens
+        invocation.completion_tokens = response.completion_tokens
+        invocation.duration_seconds = duration
+        invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
+        invocation.cost = response.cost
+        invocation.completed_at = utc_now()
+        session.add(invocation)
+        session.commit()
+
+
+def _complete_judge_invocation(session_factory, invocation_id: int, pair_id: int, winner: str, reasoning: str, response, duration: float) -> None:
+    """Persist a completed LLM judge call and its pairwise vote."""
+
+    with session_factory() as session:
+        invocation = session.get(GraphInvocation, invocation_id)
+        invocation.status = Status.complete
+        invocation.output_raw = response.text
+        invocation.output_json = maybe_repair_json(response.text)
+        invocation.prompt_tokens = response.prompt_tokens
+        invocation.completion_tokens = response.completion_tokens
+        invocation.duration_seconds = duration
+        invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
+        invocation.cost = response.cost
+        invocation.completed_at = utc_now()
+        session.add(invocation)
+        judgement = GraphJudgement(pair_id=pair_id, evaluator_type="llm_pairwise", judge_invocation_id=invocation_id, winner=winner, reasoning=reasoning)
+        pair = session.get(GraphPair, pair_id)
+        pair.status = Status.complete
+        session.add(pair)
+        session.add(judgement)
+        session.commit()
+
+
+def _fail_invocation(session_factory, invocation_id: int, error: str, category: str, *, output_raw: str | None = None, output_json: str | None = None) -> None:
+    """Persist a failed model-call state without dropping evidence."""
+
+    with session_factory() as session:
+        invocation = session.get(GraphInvocation, invocation_id)
+        invocation.status = Status.failed
+        invocation.error = error
+        invocation.error_category = category
+        if output_raw is not None:
+            invocation.output_raw = output_raw
+        if output_json is not None:
+            invocation.output_json = output_json
+        invocation.completed_at = utc_now()
+        session.add(invocation)
+        session.commit()
 
 
 def _run_spec(session, graph_run_id: int) -> GraphSpec:
@@ -641,6 +652,11 @@ def _sample_pairs(pairs: list[tuple[OutputBranch, OutputBranch]], sample_pct: fl
 
 def _terminal_candidate(lineage_key: str) -> str:
     return lineage_key.split("->")[-1] if lineage_key else ""
+
+
+def _normalized_winner(value: Any) -> Winner:
+    winner = str(value).upper()
+    return winner if winner in {"A", "B", "TIE"} else "TIE"  # type: ignore[return-value]
 
 
 def _optional_int(value: Any) -> int | None:
