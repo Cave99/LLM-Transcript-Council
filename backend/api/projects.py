@@ -10,7 +10,6 @@ from backend.api._shared import graph_summary, project_summary, require_project
 from backend.deps import get_session
 from council.graphs import delete_graph
 from council.models import ExperimentGraph, Project
-from council.runner import create_project, rename_project
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -27,7 +26,10 @@ def list_projects(session: Session = Depends(get_session)):
 def create_project_route(payload: schemas.ProjectCreate, session: Session = Depends(get_session)):
     """Create a project."""
 
-    project = create_project(session, payload.name)
+    project = Project(name=payload.name.strip() or "Untitled project")
+    session.add(project)
+    session.commit()
+    session.refresh(project)
     return project_summary(session, project)
 
 
@@ -49,9 +51,13 @@ def get_project(project_id: int, session: Session = Depends(get_session)):
 def update_project(project_id: int, payload: schemas.ProjectUpdate, session: Session = Depends(get_session)):
     """Rename a project."""
 
-    project = rename_project(session, project_id, payload.name)
-    if not project:
-        project = require_project(session, project_id)
+    project = require_project(session, project_id)
+    cleaned = payload.name.strip()
+    if cleaned:
+        project.name = cleaned
+        session.add(project)
+        session.commit()
+        session.refresh(project)
     return project_summary(session, project)
 
 
@@ -66,4 +72,3 @@ def delete_project_route(project_id: int, session: Session = Depends(get_session
     session.delete(project)
     session.commit()
     return schemas.OkResponse()
-

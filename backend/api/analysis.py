@@ -22,9 +22,7 @@ def start_judge_summary(graph_run_id: int, payload: schemas.StartJudgeSummaryReq
     start_graph_analysis_thread(
         graph_run_id,
         lambda: Session(engine),
-        judge_prompt_node_id=payload.judge_prompt_node_id,
         leaderboard_view=payload.leaderboard_view,
         top_entity_key=payload.top_entity_key,
     )
     return schemas.OkResponse()
-

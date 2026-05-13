@@ -1,38 +1,17 @@
-"""Node graph drafts and planning helpers."""
+"""Spec-backed graph CRUD, planning, and legacy import helpers."""
 
 from __future__ import annotations
 
-import itertools
-import csv
 import json
-import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
+from sqlalchemy import text
 from sqlmodel import Session, select
 
-from council.files import list_markdown_files, read_text_snapshot
-from council.models import (
-    EloRating,
-    ExperimentGraph,
-    GraphEdge,
-    Generation,
-    GeneratorConfig,
-    GraphNode,
-    GraphInvocation,
-    GraphRun,
-    GraphStatus,
-    JudgeConfig,
-    Project,
-    Run,
-    Task,
-    Transcript,
-    utc_now,
-)
-from council.run_rows import ensure_elo_rows, ensure_generation_rows, ensure_match_rows
-
-PROMPT_INPUT_RE = re.compile(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}")
+from council.graph_spec import GraphSpec, dump_spec, generated_layout, legacy_graph_to_spec, minimal_spec, parse_spec, spec_hash, validate_spec_payload
+from council.models import ExperimentGraph, GraphInvocation, GraphJudgement, GraphPair, GraphRun, GraphRunAnalysis, GraphStatus, Project, utc_now
 
 
 @dataclass(frozen=True)
@@ -40,53 +19,50 @@ class GraphPlan:
     """Computed work plan shown before a graph is launched."""
 
     transcript_count: int
-    prompt_stage_count: int
-    generator_model_count: int
-    judge_model_count: int
-    pair_count: int
-    sampled_matches_per_transcript: int
+    stage_count: int
+    candidate_count: int
+    evaluator_count: int
     generation_calls: int
-    match_count: int
+    pair_count: int
     judge_calls: int
-    swap_multiplier: int
+    human_review_count: int
     warnings: tuple[str, ...]
 
 
-def config(node: GraphNode) -> dict:
-    """Read a node config payload without leaking JSON handling to routes."""
-
-    try:
-        return json.loads(node.config_json or "{}")
-    except json.JSONDecodeError:
-        return {}
-
-
-def dump_config(values: dict) -> str:
-    """Serialize node config in one stable shape."""
-
-    return json.dumps(values, sort_keys=True)
-
-
-def prompt_inputs(template: str) -> list[str]:
-    """Return unique template sockets in first-seen order."""
-
-    seen = set()
-    inputs = []
-    for match in PROMPT_INPUT_RE.finditer(template):
-        key = match.group(1)
-        if key not in seen:
-            seen.add(key)
-            inputs.append(key)
-    return inputs
-
-
-def create_graph(session: Session, project_id: int, name: str) -> ExperimentGraph:
-    """Create an empty draft graph."""
+def create_graph(session: Session, project_id: int, name: str, spec_payload: dict[str, Any] | None = None) -> ExperimentGraph:
+    """Create a draft graph with a canonical spec."""
 
     project = session.get(Project, project_id)
     if not project:
         raise ValueError(f"Project {project_id} does not exist")
-    graph = ExperimentGraph(project_id=project_id, name=name.strip() or "Untitled graph")
+    spec = parse_spec(spec_payload)
+    graph = ExperimentGraph(
+        project_id=project_id,
+        name=name.strip() or "Untitled graph",
+        spec_json=dump_spec(spec),
+        layout_json=json.dumps(_default_layout(spec), sort_keys=True),
+        spec_hash=spec_hash(spec),
+    )
+    session.add(graph)
+    session.commit()
+    session.refresh(graph)
+    return graph
+
+
+def ensure_graph_spec(session: Session, graph: ExperimentGraph) -> ExperimentGraph:
+    """Populate spec_json for old low-level graph drafts exactly once."""
+
+    if not graph:
+        raise ValueError("Graph does not exist")
+    if graph.spec_json and graph.spec_json != "{}":
+        return graph
+    raw_nodes = _legacy_rows(session, "graphnode", graph.id)
+    raw_edges = _legacy_rows(session, "graphedge", graph.id)
+    spec, layout = legacy_graph_to_spec(raw_nodes, raw_edges) if raw_nodes else (minimal_spec(), _default_layout(minimal_spec()))
+    graph.spec_json = dump_spec(spec)
+    graph.layout_json = json.dumps(layout, sort_keys=True)
+    graph.spec_hash = spec_hash(spec)
+    graph.updated_at = utc_now()
     session.add(graph)
     session.commit()
     session.refresh(graph)
@@ -109,21 +85,61 @@ def rename_graph(session: Session, graph_id: int, name: str) -> ExperimentGraph 
     return graph
 
 
+def update_graph_spec(session: Session, graph_id: int, spec_payload: dict[str, Any], layout_payload: dict[str, Any] | None = None) -> ExperimentGraph:
+    """Persist an editable graph draft and optional canvas layout."""
+
+    graph = session.get(ExperimentGraph, graph_id)
+    if not graph:
+        raise ValueError(f"Graph {graph_id} does not exist")
+    validation = validate_spec_payload(spec_payload, require_executable=False)
+    if not validation.valid:
+        raise ValueError("; ".join(error.message for error in validation.errors))
+    spec = parse_spec(spec_payload)
+    graph.spec_json = dump_spec(spec)
+    if layout_payload is not None:
+        graph.layout_json = json.dumps(layout_payload, sort_keys=True)
+    graph.spec_hash = spec_hash(spec)
+    graph.status = GraphStatus.draft if graph.status == GraphStatus.complete else graph.status
+    graph.updated_at = utc_now()
+    session.add(graph)
+    session.commit()
+    session.refresh(graph)
+    return graph
+
+
+def update_graph_layout(session: Session, graph_id: int, layout_payload: dict[str, Any]) -> ExperimentGraph:
+    """Persist canvas layout without changing the semantic spec hash."""
+
+    graph = session.get(ExperimentGraph, graph_id)
+    if not graph:
+        raise ValueError(f"Graph {graph_id} does not exist")
+    graph.layout_json = json.dumps(layout_payload, sort_keys=True)
+    graph.updated_at = utc_now()
+    session.add(graph)
+    session.commit()
+    session.refresh(graph)
+    return graph
+
+
 def delete_graph(session: Session, graph_id: int) -> None:
-    """Delete only the graph draft/configuration record."""
+    """Delete a spec-backed graph and all graph-native child rows."""
 
     graph_run_ids = list(session.exec(select(GraphRun.id).where(GraphRun.graph_id == graph_id)).all())
     for graph_run_id in graph_run_ids:
+        for analysis in session.exec(select(GraphRunAnalysis).where(GraphRunAnalysis.graph_run_id == graph_run_id)).all():
+            session.delete(analysis)
+        pair_ids = list(session.exec(select(GraphPair.id).where(GraphPair.graph_run_id == graph_run_id)).all())
+        for pair_id in pair_ids:
+            for judgement in session.exec(select(GraphJudgement).where(GraphJudgement.pair_id == pair_id)).all():
+                session.delete(judgement)
+            pair = session.get(GraphPair, pair_id)
+            if pair:
+                session.delete(pair)
         for invocation in session.exec(select(GraphInvocation).where(GraphInvocation.graph_run_id == graph_run_id)).all():
             session.delete(invocation)
-        graph_run = session.get(GraphRun, graph_run_id)
-        if graph_run:
-            session.delete(graph_run)
-    for edge in session.exec(select(GraphEdge).where(GraphEdge.graph_id == graph_id)).all():
-        session.delete(edge)
-    nodes = session.exec(select(GraphNode).where(GraphNode.graph_id == graph_id)).all()
-    for node in nodes:
-        session.delete(node)
+        run = session.get(GraphRun, graph_run_id)
+        if run:
+            session.delete(run)
     graph = session.get(ExperimentGraph, graph_id)
     if graph:
         session.delete(graph)
@@ -131,487 +147,135 @@ def delete_graph(session: Session, graph_id: int) -> None:
 
 
 def fork_graph(session: Session, graph_id: int, name: str | None = None) -> ExperimentGraph:
-    """Create an editable draft copy of an existing graph."""
+    """Create an editable draft copy of an existing graph spec."""
 
-    source = session.get(ExperimentGraph, graph_id)
-    if not source:
-        raise ValueError(f"Graph {graph_id} does not exist")
+    source = ensure_graph_spec(session, session.get(ExperimentGraph, graph_id))
     fork = ExperimentGraph(
         project_id=source.project_id,
         name=(name or f"{source.name} draft").strip(),
         status=GraphStatus.draft,
+        spec_json=source.spec_json,
+        layout_json=source.layout_json,
+        spec_hash=source.spec_hash,
     )
     session.add(fork)
-    session.commit()
-    session.refresh(fork)
-    node_id_map: dict[int, int] = {}
-    for node in session.exec(select(GraphNode).where(GraphNode.graph_id == graph_id)).all():
-        copied = GraphNode(
-            graph_id=fork.id,
-            kind=node.kind,
-            title=node.title,
-            body=node.body,
-            config_json=node.config_json,
-            x=node.x,
-            y=node.y,
-            width=node.width,
-            height=node.height,
-        )
-        session.add(copied)
-        session.commit()
-        session.refresh(copied)
-        if node.id and copied.id:
-            node_id_map[node.id] = copied.id
-    for edge in session.exec(select(GraphEdge).where(GraphEdge.graph_id == graph_id)).all():
-        if edge.from_node_id in node_id_map and edge.to_node_id in node_id_map:
-            session.add(
-                GraphEdge(
-                    graph_id=fork.id,
-                    from_node_id=node_id_map[edge.from_node_id],
-                    from_socket=edge.from_socket,
-                    to_node_id=node_id_map[edge.to_node_id],
-                    to_socket=edge.to_socket,
-                )
-            )
     session.commit()
     session.refresh(fork)
     return fork
 
 
-def graph_nodes(session: Session, graph_id: int) -> list[GraphNode]:
-    """Return graph nodes in display order."""
+def graph_spec(graph: ExperimentGraph) -> GraphSpec:
+    """Return a parsed graph spec."""
 
-    return session.exec(select(GraphNode).where(GraphNode.graph_id == graph_id).order_by(GraphNode.x, GraphNode.id)).all()
-
-
-def graph_edges(session: Session, graph_id: int) -> list[GraphEdge]:
-    """Return persisted graph socket connections."""
-
-    return session.exec(select(GraphEdge).where(GraphEdge.graph_id == graph_id).order_by(GraphEdge.id)).all()
+    return parse_spec(graph.spec_json)
 
 
-def create_edge(session: Session, graph_id: int, *, from_node_id: int, from_socket: str, to_node_id: int, to_socket: str) -> GraphEdge:
-    """Connect one output socket to one input socket."""
+def graph_layout(graph: ExperimentGraph) -> dict[str, Any]:
+    """Return graph layout JSON."""
 
-    if from_node_id == to_node_id:
-        raise ValueError("Cannot connect a node to itself")
-    existing = session.exec(
-        select(GraphEdge).where(
-            GraphEdge.graph_id == graph_id,
-            GraphEdge.from_node_id == from_node_id,
-            GraphEdge.from_socket == from_socket,
-            GraphEdge.to_node_id == to_node_id,
-            GraphEdge.to_socket == to_socket,
-        )
-    ).first()
-    if existing:
-        return existing
-    edge = GraphEdge(
-        graph_id=graph_id,
-        from_node_id=from_node_id,
-        from_socket=from_socket,
-        to_node_id=to_node_id,
-        to_socket=to_socket,
-    )
-    session.add(edge)
-    _touch_graph(session, graph_id)
-    session.commit()
-    session.refresh(edge)
-    return edge
+    try:
+        return json.loads(graph.layout_json or "{}")
+    except json.JSONDecodeError:
+        return {}
 
 
-def delete_edge(session: Session, edge_id: int) -> int | None:
-    """Delete one graph connection and return its graph id."""
+def semantic_nodes_edges(graph: ExperimentGraph):
+    """Return semantic React Flow nodes and edges generated from the spec."""
 
-    edge = session.get(GraphEdge, edge_id)
-    if not edge:
-        return None
-    graph_id = edge.graph_id
-    session.delete(edge)
-    _touch_graph(session, graph_id)
-    session.commit()
-    return graph_id
+    return generated_layout(graph_spec(graph), graph_layout(graph))
 
 
-def delete_socket_edges(session: Session, graph_id: int, *, node_id: int, socket: str, side: str) -> None:
-    """Delete every connection attached to one node socket."""
+def plan_graph(session: Session, graph_id: int, *, sample_size: int | None = None) -> GraphPlan:
+    """Calculate spec-backed call counts and launch warnings."""
 
-    if side == "input":
-        query = select(GraphEdge).where(
-            GraphEdge.graph_id == graph_id,
-            GraphEdge.to_node_id == node_id,
-            GraphEdge.to_socket == socket,
-        )
-    elif side == "output":
-        query = select(GraphEdge).where(
-            GraphEdge.graph_id == graph_id,
-            GraphEdge.from_node_id == node_id,
-            GraphEdge.from_socket == socket,
-        )
-    else:
-        return
-    for edge in session.exec(query).all():
-        session.delete(edge)
-    _touch_graph(session, graph_id)
-    session.commit()
-
-
-def delete_node(session: Session, node_id: int) -> int | None:
-    """Delete a node and any edges connected to it, returning its graph id."""
-
-    node = session.get(GraphNode, node_id)
-    if not node:
-        return None
-    graph_id = node.graph_id
-    for edge in session.exec(
-        select(GraphEdge).where(
-            (GraphEdge.from_node_id == node_id) | (GraphEdge.to_node_id == node_id)
-        )
-    ).all():
-        session.delete(edge)
-    session.delete(node)
-    _touch_graph(session, graph_id)
-    session.commit()
-    return graph_id
-
-
-def update_node(session: Session, node_id: int, *, title: str, body: str, config_values: dict) -> GraphNode:
-    """Persist one edited node after the user clicks done."""
-
-    node = session.get(GraphNode, node_id)
-    if not node:
-        raise ValueError(f"Node {node_id} does not exist")
-    node.title = title.strip() or node.title
-    node.body = body
-    node.config_json = dump_config(config_values)
-    node.updated_at = utc_now()
-    session.add(node)
-    graph = session.get(ExperimentGraph, node.graph_id)
-    if graph:
-        graph.updated_at = utc_now()
-        graph.status = GraphStatus.draft if graph.status == GraphStatus.complete else graph.status
-        session.add(graph)
-    session.commit()
-    session.refresh(node)
-    return node
-
-
-def add_model_node(session: Session, graph_id: int, *, title: str, model_id: str, role: str, x: int | None = None, y: int | None = None) -> GraphNode:
-    """Add a reusable model config node."""
-
-    count = len([n for n in graph_nodes(session, graph_id) if n.kind == "model"])
-    node = GraphNode(
-        graph_id=graph_id,
-        kind="model",
-        title=title.strip() or model_id.strip() or "Model",
-        config_json=dump_config(
-            {
-                "model_id": model_id.strip(),
-                "temperature": 0.2 if role == "generator" else 0.0,
-                "max_tokens": "",
-                "retry_count": 2,
-                "reasoning_supported": False,
-                "reasoning_effort": "",
-                "input_price": "",
-                "output_price": "",
-                "role": role,
-            }
-        ),
-        x=x if x is not None else (620 if role == "generator" else 1220),
-        y=y if y is not None else 24 + count * 96,
-    )
-    session.add(node)
-    _touch_graph(session, graph_id)
-    session.commit()
-    session.refresh(node)
-    return node
-
-
-def add_constant_node(session: Session, graph_id: int, *, title: str, body: str, x: int | None = None, y: int | None = None) -> GraphNode:
-    """Add a text node that can fill prompt sockets."""
-
-    node = GraphNode(graph_id=graph_id, kind="constant", title=title.strip() or "Constant", body=body, x=x if x is not None else 24, y=y if y is not None else 260)
-    session.add(node)
-    _touch_graph(session, graph_id)
-    session.commit()
-    session.refresh(node)
-    return node
-
-
-def add_prompt_node(session: Session, graph_id: int, *, title: str = "Next prompt", x: int | None = None, y: int | None = None) -> GraphNode:
-    """Add another prompt stage for chained graph flows."""
-
-    prompts = [node for node in graph_nodes(session, graph_id) if node.kind == "prompt"]
-    node = GraphNode(
-        graph_id=graph_id,
-        kind="prompt",
-        title=title,
-        body="## Input\n{{ transcript }}\n\n## Previous output\n{{ previous_output }}",
-        config_json=dump_config({"upstream_mode": "raw"}),
-        x=x if x is not None else 320 + len(prompts) * 300,
-        y=y if y is not None else 160,
-    )
-    session.add(node)
-    _touch_graph(session, graph_id)
-    session.commit()
-    session.refresh(node)
-    return node
-
-
-def add_judge_node(session: Session, graph_id: int, *, title: str = "Pairwise judge prompt", x: int | None = None, y: int | None = None) -> GraphNode:
-    """Add a judge prompt node with explicit winner/reasoning output config."""
-
-    node = GraphNode(
-        graph_id=graph_id,
-        kind="judge",
-        title=title,
-        body="## Task\n{{ task_description }}\n\n## Transcript\n{{ transcript }}\n\n## Output A\n{{ output_a }}\n\n## Output B\n{{ output_b }}\n\nReturn JSON with `reasoning` and `winner` as A, B, or TIE.",
-        config_json=dump_config({"pairing_sample_pct": 20, "swap_enabled": True, "seed": "", "winner_key": "winner", "reasoning_key": "reasoning"}),
-        x=x if x is not None else 920,
-        y=y if y is not None else 24,
-    )
-    session.add(node)
-    _touch_graph(session, graph_id)
-    session.commit()
-    session.refresh(node)
-    return node
-
-
-def add_dataset_node(session: Session, graph_id: int, *, x: int | None = None, y: int | None = None) -> GraphNode:
-    """Add a dataset node from the configure palette."""
-
-    node = GraphNode(
-        graph_id=graph_id,
-        kind="dataset",
-        title="Dataset",
-        config_json=dump_config({"source_type": "markdown", "path": str(Path("transcripts").resolve()), "sample_size": "", "id_column": "call_id", "text_column": "transcript"}),
-        x=x if x is not None else 24,
-        y=y if y is not None else 24,
-    )
-    session.add(node)
-    _touch_graph(session, graph_id)
-    session.commit()
-    session.refresh(node)
-    return node
-
-
-def update_node_position(session: Session, node_id: int, *, x: int, y: int, width: int | None = None, height: int | None = None) -> GraphNode:
-    """Persist canvas geometry after a node is moved or resized."""
-
-    node = session.get(GraphNode, node_id)
-    if not node:
-        raise ValueError(f"Node {node_id} does not exist")
-    node.x = x
-    node.y = y
-    if width is not None:
-        node.width = max(300, min(1100, width))
-    if height is not None:
-        node.height = max(160, min(1000, height))
-    node.updated_at = utc_now()
-    session.add(node)
-    _touch_graph(session, node.graph_id)
-    session.commit()
-    session.refresh(node)
-    return node
-
-
-def plan_graph(session: Session, graph_id: int) -> GraphPlan:
-    """Calculate call counts and validation warnings for the visible graph."""
-
-    nodes = graph_nodes(session, graph_id)
-    edges = graph_edges(session, graph_id)
-    dataset = _one(nodes, "dataset")
-    prompt_stages = _prompt_stages(nodes)
-    generator_prompt = prompt_stages[0] if prompt_stages else None
-    judge_prompt = _one(nodes, "judge")
-    generator_models = _models(nodes, "generator")
-    judge_models = _models(nodes, "judge")
-    settings = config(judge_prompt) if judge_prompt else {}
-    transcript_count = _transcript_count(dataset)
-    stage_model_counts = [_connected_model_count(prompt, generator_models, edges) for prompt in prompt_stages]
-    pair_count = _graph_pair_count(prompt_stages, judge_prompt, edges, stage_model_counts, generator_models)
-    sample_pct = _sample_pct(settings)
-    sampled_per_transcript = _sampled_pair_count(pair_count, sample_pct)
-    generation_calls = _graph_generation_calls(transcript_count, stage_model_counts)
-    match_count, judge_calls = _graph_judge_counts(transcript_count, prompt_stages, [node for node in nodes if node.kind == "judge"], edges, stage_model_counts, generator_models, judge_models)
-    swap_multiplier = 2 if settings.get("swap_enabled", True) else 1
-    warnings = list(_plan_warnings(dataset, generator_prompt, judge_prompt, generator_models, judge_models, transcript_count))
-    if pair_count and sampled_per_transcript < pair_count and transcript_count * sampled_per_transcript < pair_count:
-        warnings.append("Sampling is too low to cover every model pair at least once.")
+    graph = ensure_graph_spec(session, session.get(ExperimentGraph, graph_id))
+    spec = graph_spec(graph)
+    transcript_count = _dataset_count(spec)
+    if sample_size:
+        transcript_count = min(transcript_count, sample_size)
+    stage_branch_counts: list[int] = []
+    current_branches = 1
+    generation_calls = 0
+    candidate_count = 0
+    warnings: list[str] = []
+    for stage in spec.stages:
+        candidates = len(stage.candidates)
+        candidate_count += candidates
+        calls = transcript_count * current_branches * candidates
+        generation_calls += calls
+        current_branches = max(1, current_branches * max(1, candidates))
+        stage_branch_counts.append(current_branches)
+        if calls > 1000:
+            warnings.append(f"Stage {stage.id} will create {calls:,} generation calls with matrix fanout.")
+    pair_count = 0
+    judge_calls = 0
+    human_review_count = 0
+    stage_index = {stage.id: index for index, stage in enumerate(spec.stages)}
+    for evaluator in spec.evaluators:
+        target_index = stage_index.get(evaluator.target_stage)
+        branches = stage_branch_counts[target_index] if target_index is not None and target_index < len(stage_branch_counts) else 0
+        pairs_per_item = branches * (branches - 1) // 2
+        sampled = _sampled_pair_count(pairs_per_item, evaluator.pairing.sample_pct)
+        multiplier = 2 if evaluator.pairing.swap else 1
+        evaluator_pairs = transcript_count * sampled * multiplier
+        pair_count += evaluator_pairs
+        if evaluator.type == "human_pairwise":
+            human_review_count += evaluator_pairs
+        else:
+            judge_calls += evaluator_pairs
     return GraphPlan(
         transcript_count=transcript_count,
-        prompt_stage_count=len(prompt_stages),
-        generator_model_count=len(generator_models),
-        judge_model_count=len(judge_models),
-        pair_count=pair_count,
-        sampled_matches_per_transcript=sampled_per_transcript,
+        stage_count=len(spec.stages),
+        candidate_count=candidate_count,
+        evaluator_count=len(spec.evaluators),
         generation_calls=generation_calls,
-        match_count=match_count,
+        pair_count=pair_count,
         judge_calls=judge_calls,
-        swap_multiplier=swap_multiplier,
+        human_review_count=human_review_count,
         warnings=tuple(warnings),
     )
 
 
-def launch_graph_run(session: Session, graph_id: int, *, max_concurrency: int = 5) -> Run:
-    """Compile a graph draft into the current auditable run tables."""
-
-    graph = session.get(ExperimentGraph, graph_id)
-    if not graph:
-        raise ValueError(f"Graph {graph_id} does not exist")
-    nodes = graph_nodes(session, graph_id)
-    dataset = _require_one(nodes, "dataset")
-    prompt_stages = _prompt_stages(nodes)
-    generator_prompt = prompt_stages[0] if prompt_stages else None
-    if not generator_prompt:
-        raise ValueError("Graph needs a prompt node")
-    judge_prompt = _require_one(nodes, "judge")
-    generator_models = _models(nodes, "generator")
-    judge_models = _models(nodes, "judge")
-    if len(generator_models) < 2:
-        raise ValueError("At least two generator model nodes are required")
-    if not judge_models:
-        raise ValueError("At least one judge model node is required")
-
-    dataset_cfg = config(dataset)
-    judge_cfg = config(judge_prompt)
-    if dataset_cfg.get("source_type", "markdown") != "markdown":
-        raise ValueError("Compiled ELO runs currently support markdown-folder datasets only")
-    paths = list_markdown_files(dataset_cfg.get("path", ""))
-    sample_size = int(dataset_cfg.get("sample_size") or 0)
-    if sample_size:
-        paths = paths[:sample_size]
-    if not paths:
-        raise ValueError("No transcript markdown files selected")
-    task_description = _task_description(nodes)
-    task = Task(
-        project_id=graph.project_id,
-        name=f"{graph.name} task snapshot",
-        description_path=f"graph://{graph.id}/task_description",
-        description_snapshot=task_description,
-        description_hash=f"graph-{graph.id}-{len(task_description)}",
-        transcript_root=dataset_cfg.get("path", ""),
-        default_judge_prompt_path=f"graph://node/{judge_prompt.id}",
-        default_pairing_sample_pct=_sample_pct(judge_cfg),
-        default_swap_enabled=bool(judge_cfg.get("swap_enabled", True)),
-    )
-    session.add(task)
-    session.commit()
-    session.refresh(task)
-
-    run = Run(
-        task_id=task.id,
-        name=graph.name,
-        max_concurrency=max_concurrency,
-        pairing_sample_pct=_sample_pct(judge_cfg),
-        swap_enabled=bool(judge_cfg.get("swap_enabled", True)),
-    )
-    session.add(run)
-    session.commit()
-    session.refresh(run)
-
-    for model in generator_models:
-        model_cfg = config(model)
-        session.add(
-            GeneratorConfig(
-                run_id=run.id,
-                label=model.title,
-                model_id=model_cfg.get("model_id", "").strip(),
-                temperature=float(model_cfg.get("temperature") or 0.0),
-                prompt_path=f"graph://node/{generator_prompt.id}",
-                prompt_snapshot=generator_prompt.body,
-                prompt_hash=f"graph-node-{generator_prompt.id}-{len(generator_prompt.body)}",
-            )
-        )
-    for model in judge_models:
-        model_cfg = config(model)
-        session.add(
-            JudgeConfig(
-                run_id=run.id,
-                label=model.title,
-                model_id=model_cfg.get("model_id", "").strip(),
-                temperature=float(model_cfg.get("temperature") or 0.0),
-                prompt_path=f"graph://node/{judge_prompt.id}",
-                prompt_snapshot=judge_prompt.body,
-                prompt_hash=f"graph-node-{judge_prompt.id}-{len(judge_prompt.body)}",
-            )
-        )
-
-    for path in paths:
-        snapshot = read_text_snapshot(path)
-        session.add(Transcript(run_id=run.id, path=snapshot.path, content_snapshot=snapshot.content, content_hash=snapshot.content_hash))
-    session.commit()
-    ensure_generation_rows(session, run.id)
-    ensure_match_rows(session, run.id)
-    ensure_elo_rows(session, run.id)
-
-    graph.status = GraphStatus.running
-    graph.last_run_id = run.id
-    graph.updated_at = utc_now()
-    session.add(graph)
-    session.commit()
-    session.refresh(run)
-    return run
-
-
-def sync_graph_status(session: Session, graph: ExperimentGraph) -> ExperimentGraph:
-    """Mirror the latest run status onto graph cards."""
-
-    if graph.last_run_id:
-        run = session.get(Run, graph.last_run_id)
-        if run and run.status.value in {status.value for status in GraphStatus}:
-            graph.status = GraphStatus(run.status.value)
-            session.add(graph)
-            session.commit()
-            session.refresh(graph)
-    return graph
-
-
-def _touch_graph(session: Session, graph_id: int) -> None:
-    graph = session.get(ExperimentGraph, graph_id)
-    if graph:
-        graph.updated_at = utc_now()
-        session.add(graph)
-
-
-def _one(nodes: list[GraphNode], kind: str) -> GraphNode | None:
-    return next((node for node in nodes if node.kind == kind), None)
-
-
-def _require_one(nodes: list[GraphNode], kind: str) -> GraphNode:
-    node = _one(nodes, kind)
-    if not node:
-        raise ValueError(f"Graph needs a {kind} node")
-    return node
-
-
-def _models(nodes: list[GraphNode], role: str) -> list[GraphNode]:
-    return [node for node in nodes if node.kind == "model" and config(node).get("role") == role and config(node).get("model_id", "").strip()]
-
-
-def _prompt_stages(nodes: list[GraphNode]) -> list[GraphNode]:
-    return sorted([node for node in nodes if node.kind == "prompt"], key=lambda node: (node.x, node.y, node.id or 0))
-
-
-def _transcript_count(dataset: GraphNode | None) -> int:
-    if not dataset:
-        return 0
-    cfg = config(dataset)
-    if cfg.get("source_type", "markdown") == "csv":
-        rows = _csv_rows(cfg.get("path", ""), cfg.get("sample_size", ""))
-        return len(rows)
-    paths = list_markdown_files(cfg.get("path", ""))
-    sample_size = int(cfg.get("sample_size") or 0)
-    if sample_size:
-        paths = paths[:sample_size]
-    return len(paths)
-
-
-def _sample_pct(settings: dict) -> float:
+def _legacy_rows(session: Session, table_name: str, graph_id: int) -> list[dict[str, Any]]:
     try:
-        return max(1.0, min(100.0, float(settings.get("pairing_sample_pct") or 100)))
+        connection = session.connection()
+        result = connection.execute(text(f"SELECT * FROM {table_name} WHERE graph_id = :graph_id"), {"graph_id": graph_id})
+        return [dict(row._mapping) for row in result.all()]
+    except Exception:
+        return []
+
+
+def _default_layout(spec: GraphSpec) -> dict[str, dict[str, int]]:
+    nodes, _edges = generated_layout(spec, {})
+    return {node.id: {"x": node.x, "y": node.y} for node in nodes}
+
+
+def _dataset_count(spec: GraphSpec) -> int:
+    cfg = spec.dataset.config
+    path = str(cfg.get("path") or "")
+    sample_size = _optional_int(cfg.get("sample_size"))
+    if spec.dataset.provider == "csv":
+        import csv
+
+        try:
+            with Path(path).open(newline="", encoding="utf-8") as handle:
+                count = sum(1 for _row in csv.DictReader(handle))
+        except OSError:
+            return 0
+    else:
+        root = Path(path)
+        if not root.exists():
+            return 0
+        count = len(sorted([p for p in root.iterdir() if p.suffix.lower() in {".md", ".txt"}]))
+    return min(count, sample_size) if sample_size else count
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else None
     except (TypeError, ValueError):
-        return 100.0
+        return None
 
 
 def _sampled_pair_count(pair_count: int, sample_pct: float) -> int:
@@ -619,130 +283,4 @@ def _sampled_pair_count(pair_count: int, sample_pct: float) -> int:
         return 0
     if sample_pct >= 100:
         return pair_count
-    return max(1, round(pair_count * (sample_pct / 100.0)))
-
-
-def _graph_judge_counts(
-    transcript_count: int,
-    prompt_stages: list[GraphNode],
-    judge_prompts: list[GraphNode],
-    edges: list[GraphEdge],
-    stage_model_counts: list[int],
-    generator_models: list[GraphNode],
-    judge_models: list[GraphNode],
-) -> tuple[int, int]:
-    """Estimate judge work using each judge prompt's visual target stage."""
-
-    match_count = 0
-    judge_calls = 0
-    for judge_prompt in judge_prompts:
-        pair_count = _graph_pair_count(prompt_stages, judge_prompt, edges, stage_model_counts, generator_models)
-        sampled = _sampled_pair_count(pair_count, _sample_pct(config(judge_prompt)))
-        matches = transcript_count * sampled
-        swap_multiplier = 2 if config(judge_prompt).get("swap_enabled", True) else 1
-        match_count += matches
-        judge_calls += matches * _connected_model_count(judge_prompt, judge_models, edges) * swap_multiplier
-    return match_count, judge_calls
-
-
-def _graph_pair_count(prompt_stages: list[GraphNode], judge_prompt: GraphNode | None, edges: list[GraphEdge], stage_model_counts: list[int], generator_models: list[GraphNode]) -> int:
-    """Estimate pair count per dataset item for a judge's target prompt."""
-
-    if not prompt_stages:
-        return 0
-    target_prompt = _judge_target_prompt(judge_prompt, prompt_stages, edges, generator_models)
-    stage_number = prompt_stages.index(target_prompt) + 1 if target_prompt in prompt_stages else len(prompt_stages)
-    branch_count = _branch_count_after_stage(stage_model_counts, stage_number)
-    return math.comb(branch_count, 2) if branch_count >= 2 else 0
-
-
-def _graph_generation_calls(transcript_count: int, stage_model_counts: list[int]) -> int:
-    """Estimate generation calls with per-prompt connected model counts."""
-
-    branches_per_item = 1
-    total = 0
-    for model_count in stage_model_counts:
-        calls_per_item = branches_per_item * model_count
-        total += transcript_count * calls_per_item
-        branches_per_item = calls_per_item
-    return total
-
-
-def _branch_count_after_stage(stage_model_counts: list[int], stage_number: int) -> int:
-    branches = 1
-    for model_count in stage_model_counts[:stage_number]:
-        branches *= model_count
-    return branches
-
-
-def _connected_model_count(source: GraphNode, candidates: list[GraphNode], edges: list[GraphEdge]) -> int:
-    """Count models visually connected from a prompt or judge, fallback to all."""
-
-    candidate_ids = {node.id for node in candidates}
-    connected_ids = []
-    for edge in edges:
-        if edge.from_node_id == source.id and edge.to_node_id in candidate_ids and edge.to_node_id not in connected_ids:
-            connected_ids.append(edge.to_node_id)
-    return len(connected_ids) if connected_ids else len(candidates)
-
-
-def _judge_target_prompt(judge_prompt: GraphNode | None, prompt_stages: list[GraphNode], edges: list[GraphEdge], generator_models: list[GraphNode]) -> GraphNode | None:
-    """Find the prompt connected to a judge, falling back to the final stage."""
-
-    if not prompt_stages:
-        return None
-    prompt_by_id = {prompt.id: prompt for prompt in prompt_stages}
-    if judge_prompt:
-        incoming = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in prompt_by_id]
-        if incoming:
-            return prompt_by_id[incoming[-1]]
-        generator_model_ids = {node.id for node in generator_models}
-        incoming_models = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in generator_model_ids]
-        if incoming_models:
-            prompt_ids = [edge.from_node_id for edge in edges if edge.to_node_id in incoming_models and edge.from_node_id in prompt_by_id]
-            if prompt_ids:
-                return prompt_by_id[prompt_ids[-1]]
-    return prompt_stages[-1]
-
-
-def _plan_warnings(
-    dataset: GraphNode | None,
-    generator_prompt: GraphNode | None,
-    judge_prompt: GraphNode | None,
-    generator_models: list[GraphNode],
-    judge_models: list[GraphNode],
-    transcript_count: int,
-):
-    if not dataset:
-        yield "Add a dataset node."
-    elif transcript_count == 0:
-        yield "Dataset has no selected markdown transcripts."
-    elif config(dataset).get("source_type", "markdown") == "csv":
-        yield "CSV datasets can run with chained graph launch; ELO launch currently expects a markdown folder."
-    if not generator_prompt:
-        yield "Add a generator prompt node."
-    if not judge_prompt:
-        yield "Add a judge prompt node."
-    elif not config(judge_prompt).get("winner_key") or not config(judge_prompt).get("reasoning_key"):
-        yield "Judge output is not configured. Set winner and reasoning keys before launching ELO judging."
-    if len(generator_models) < 2:
-        yield "Add at least two generator model nodes."
-    if not judge_models:
-        yield "Add at least one judge model node."
-
-
-def _task_description(nodes: list[GraphNode]) -> str:
-    task_node = next((node for node in nodes if node.kind == "constant" and config(node).get("socket") == "task_description"), None)
-    return task_node.body if task_node else ""
-
-
-def _csv_rows(path: str, sample_size: str | int | None = None) -> list[dict[str, str]]:
-    if not path:
-        return []
-    csv_path = Path(path).expanduser()
-    if not csv_path.exists() or not csv_path.is_file():
-        return []
-    with csv_path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    limit = int(sample_size or 0)
-    return rows[:limit] if limit else rows
+    return max(1, int(pair_count * max(1.0, min(100.0, sample_pct)) / 100))

@@ -1,0 +1,28 @@
+{
+  "id": "2343a52c",
+  "phase": "completed",
+  "pageUrl": "/graphs/7",
+  "sourceFile": "frontend/src/features/graphs/graph-detail-page.tsx",
+  "expectedVariants": 3,
+  "arrivedVariants": 3,
+  "visibleVariant": 2,
+  "paramValues": {
+    "density": 1
+  },
+  "pendingEventSeq": null,
+  "pendingEvent": null,
+  "deliveryLease": null,
+  "checkpointRevision": 8,
+  "activeOwner": "1e27f5fb",
+  "sourceMarkers": {},
+  "fallbackMode": null,
+  "annotationArtifacts": [],
+  "diagnostics": [
+    {
+      "error": "carbonize_cleanup_required",
+      "file": "frontend/src/features/graphs/graph-detail-page.tsx",
+      "message": "Accepted variant still has carbonize markers that must be folded into source CSS."
+    }
+  ],
+  "updatedAt": "2026-05-13T03:42:08.995Z"
+}

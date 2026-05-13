@@ -1,16 +1,14 @@
-"""Shared API mapping helpers."""
+"""Shared API mapping helpers for spec-backed graphs."""
 
 from __future__ import annotations
-
-import json
 
 from fastapi import HTTPException
 from sqlmodel import Session, select
 
 from backend import schemas
 from council.graph_runtime import graph_native_progress, graph_run_leaderboards
-from council.graphs import config, graph_edges, graph_nodes, plan_graph, prompt_inputs
-from council.models import ExperimentGraph, GraphEdge, GraphInvocation, GraphNode, GraphRun, GraphRunAnalysis, Project, Status
+from council.graphs import ensure_graph_spec, graph_layout, graph_spec, plan_graph, semantic_nodes_edges
+from council.models import ExperimentGraph, GraphInvocation, GraphJudgement, GraphPair, GraphRun, GraphRunAnalysis, Project, Status
 
 
 def api_error(status_code: int, code: str, message: str) -> HTTPException:
@@ -30,7 +28,7 @@ def require_graph(session: Session, graph_id: int) -> ExperimentGraph:
     graph = session.get(ExperimentGraph, graph_id)
     if not graph:
         raise api_error(404, "not_found", f"Graph {graph_id} does not exist")
-    return graph
+    return ensure_graph_spec(session, graph)
 
 
 def require_graph_run(session: Session, graph_run_id: int) -> GraphRun:
@@ -47,6 +45,7 @@ def graph_summary(graph: ExperimentGraph) -> schemas.GraphSummary:
         name=graph.name,
         status=graph.status.value,
         last_run_id=graph.last_run_id,
+        spec_hash=graph.spec_hash,
         created_at=graph.created_at,
         updated_at=graph.updated_at,
     )
@@ -71,149 +70,43 @@ def project_summary(session: Session, project: Project) -> schemas.ProjectSummar
     graph_ids = list(session.exec(select(ExperimentGraph.id).where(ExperimentGraph.project_id == project.id)).all())
     recent_runs = []
     if graph_ids:
-        recent_runs = session.exec(
-            select(GraphRun)
-            .where(GraphRun.graph_id.in_(graph_ids))
-            .order_by(GraphRun.created_at.desc())
-            .limit(5)
-        ).all()
-    return schemas.ProjectSummary(
-        id=project.id,
-        name=project.name,
-        created_at=project.created_at,
-        graph_count=len(graph_ids),
-        recent_graph_runs=[graph_run_summary(run) for run in recent_runs],
-    )
+        recent_runs = session.exec(select(GraphRun).where(GraphRun.graph_id.in_(graph_ids)).order_by(GraphRun.created_at.desc()).limit(5)).all()
+    return schemas.ProjectSummary(id=project.id, name=project.name, created_at=project.created_at, graph_count=len(graph_ids), recent_graph_runs=[graph_run_summary(run) for run in recent_runs])
 
 
 def graph_plan_dto(session: Session, graph_id: int) -> schemas.GraphPlanDto:
     plan = plan_graph(session, graph_id)
     return schemas.GraphPlanDto(
         transcript_count=plan.transcript_count,
-        prompt_stage_count=plan.prompt_stage_count,
-        generator_model_count=plan.generator_model_count,
-        judge_model_count=plan.judge_model_count,
-        pair_count=plan.pair_count,
-        sampled_matches_per_transcript=plan.sampled_matches_per_transcript,
+        stage_count=plan.stage_count,
+        candidate_count=plan.candidate_count,
+        evaluator_count=plan.evaluator_count,
         generation_calls=plan.generation_calls,
-        match_count=plan.match_count,
+        pair_count=plan.pair_count,
         judge_calls=plan.judge_calls,
-        swap_multiplier=plan.swap_multiplier,
+        human_review_count=plan.human_review_count,
         warnings=list(plan.warnings),
     )
 
 
-def node_dto(node: GraphNode) -> schemas.GraphNodeDto:
-    cfg = config(node)
-    return schemas.GraphNodeDto(
-        id=node.id,
-        graph_id=node.graph_id,
-        kind=node.kind,
-        title=node.title,
-        body=node.body,
-        config=cfg,
-        x=node.x,
-        y=node.y,
-        width=node.width,
-        height=node.height,
-        input_sockets=input_sockets(node, cfg),
-        output_sockets=output_sockets(node, cfg),
-        created_at=node.created_at,
-        updated_at=node.updated_at,
-    )
-
-
-def edge_dto(edge: GraphEdge) -> schemas.GraphEdgeDto:
-    return schemas.GraphEdgeDto(
-        id=edge.id,
-        graph_id=edge.graph_id,
-        from_node_id=edge.from_node_id,
-        from_socket=edge.from_socket,
-        to_node_id=edge.to_node_id,
-        to_socket=edge.to_socket,
-        created_at=edge.created_at,
-    )
-
-
 def graph_detail(session: Session, graph: ExperimentGraph) -> schemas.GraphDetail:
-    latest_run = None
-    if graph.last_run_id:
-        latest = session.get(GraphRun, graph.last_run_id)
-        latest_run = graph_run_summary(latest) if latest else None
-    graph_runs = session.exec(
-        select(GraphRun)
-        .where(GraphRun.graph_id == graph.id)
-        .order_by(GraphRun.created_at.desc())
-        .limit(25)
-    ).all()
+    latest_run = graph_run_summary(session.get(GraphRun, graph.last_run_id)) if graph.last_run_id and session.get(GraphRun, graph.last_run_id) else None
+    graph_runs = session.exec(select(GraphRun).where(GraphRun.graph_id == graph.id).order_by(GraphRun.created_at.desc()).limit(25)).all()
+    nodes, edges = semantic_nodes_edges(graph)
     return schemas.GraphDetail(
         graph=graph_summary(graph),
-        nodes=[node_dto(node) for node in graph_nodes(session, graph.id)],
-        edges=[edge_dto(edge) for edge in graph_edges(session, graph.id)],
+        spec=graph_spec(graph).model_dump(mode="json", exclude_none=True),
+        layout=graph_layout(graph),
+        nodes=[schemas.SemanticNodeDto(id=node.id, kind=node.kind, title=node.title, x=node.x, y=node.y) for node in nodes],
+        edges=[schemas.SemanticEdgeDto(id=edge["id"], source=edge["source"], target=edge["target"]) for edge in edges],
         plan=graph_plan_dto(session, graph.id),
         latest_run=latest_run,
         graph_runs=[graph_run_summary(run) for run in graph_runs],
     )
 
 
-def input_sockets(node: GraphNode, cfg: dict | None = None) -> list[str]:
-    cfg = cfg if cfg is not None else config(node)
-    if node.kind == "prompt":
-        return prompt_inputs(node.body)
-    if node.kind == "judge":
-        sockets = prompt_inputs(node.body)
-        defaults = ["models", "output", "output_a", "output_b"]
-        return unique([*sockets, *defaults])
-    if node.kind == "model":
-        return ["model", "prompt", "judge_prompt"]
-    return []
-
-
-def output_sockets(node: GraphNode, cfg: dict | None = None) -> list[str]:
-    cfg = cfg if cfg is not None else config(node)
-    if node.kind == "dataset":
-        if cfg.get("source_type", "markdown") == "csv":
-            return unique(["transcript", cfg.get("id_column") or "call_id", "row_json"])
-        return ["transcript", "call_id"]
-    if node.kind == "constant":
-        return [str(cfg.get("socket") or node.title or "constant")]
-    if node.kind == "prompt":
-        return ["output", "full_prompt", "template"]
-    if node.kind == "model":
-        return ["model", "raw", "json"]
-    if node.kind == "judge":
-        return ["judgement", "judge_prompt"]
-    return []
-
-
-def unique(values: list[str]) -> list[str]:
-    seen = set()
-    result = []
-    for value in values:
-        if value and value not in seen:
-            seen.add(value)
-            result.append(value)
-    return result
-
-
 def progress_dto(progress: dict[str, int]) -> schemas.GraphProgress:
     return schemas.GraphProgress(**progress)
-
-
-def node_progress(session: Session, nodes: list[GraphNode], invocations: list[GraphInvocation]) -> dict[int, schemas.GraphProgress]:
-    by_node = {}
-    for node in nodes:
-        rows = [row for row in invocations if row.node_id == node.id]
-        by_node[node.id] = progress_dto(
-            {
-                "total": len(rows),
-                "pending": sum(1 for row in rows if row.status == Status.pending),
-                "running": sum(1 for row in rows if row.status == Status.running),
-                "complete": sum(1 for row in rows if row.status == Status.complete),
-                "failed": sum(1 for row in rows if row.status == Status.failed),
-            }
-        )
-    return by_node
 
 
 def graph_run_diagnostics(run: GraphRun, progress: dict[str, int]) -> list[schemas.GraphDiagnostic]:
@@ -221,7 +114,7 @@ def graph_run_diagnostics(run: GraphRun, progress: dict[str, int]) -> list[schem
     if run.error:
         diagnostics.append(schemas.GraphDiagnostic(level="error", message=run.error))
     if progress["failed"]:
-        diagnostics.append(schemas.GraphDiagnostic(level="warning", message=f"{progress['failed']} invocation(s) failed."))
+        diagnostics.append(schemas.GraphDiagnostic(level="warning", message=f"{progress['failed']} model call(s) failed."))
     if run.status == Status.running:
         diagnostics.append(schemas.GraphDiagnostic(level="info", message="Worker is running."))
     if not diagnostics:
@@ -229,30 +122,22 @@ def graph_run_diagnostics(run: GraphRun, progress: dict[str, int]) -> list[schem
     return diagnostics
 
 
-def leaderboard_groups(session: Session, run: GraphRun, nodes: list[GraphNode], view_mode: str) -> list[schemas.GraphLeaderboardGroup]:
-    normalized = view_mode if view_mode in {"aggregate", "overall", "chain"} else "aggregate"
-    groups = graph_run_leaderboards(session, run.id, nodes, view_mode=normalized)
-    if normalized == "overall" and groups:
-        groups = [groups[0]]
-    elif normalized != "overall":
-        scoped = [group for group in groups if group["title"] != "Overall"]
-        groups = scoped or groups
+def leaderboard_groups(session: Session, run: GraphRun, view_mode: str) -> list[schemas.GraphLeaderboardGroup]:
+    groups = graph_run_leaderboards(session, run.id, view_mode=view_mode)
     return [
         schemas.GraphLeaderboardGroup(
             title=group["title"],
-            judge_prompt_node_id=group.get("judge_prompt_node_id"),
-            view_mode=group.get("view_mode", normalized),
+            view_mode=group.get("view_mode", view_mode),
             rows=[
                 schemas.GraphLeaderboardRow(
                     entity_key=row["entity_key"],
                     label=row["label"],
-                    node_id=row["node"].id if row.get("node") else None,
                     rating=row["rating"],
                     wins=row["wins"],
                     losses=row["losses"],
                     ties=row["ties"],
                     avg_tokens=row["avg_tokens"],
-                    favorites=[schemas.LeaderboardFavorite(id=fav.id, title=fav.title) for fav in row.get("favorites", [])],
+                    favorites=[schemas.LeaderboardFavorite(id=fav["id"], title=fav["title"]) for fav in row.get("favorites", [])],
                 )
                 for row in group["rows"]
             ],
@@ -261,16 +146,16 @@ def leaderboard_groups(session: Session, run: GraphRun, nodes: list[GraphNode], 
     ]
 
 
-def invocation_dto(invocation: GraphInvocation, node_lookup: dict[int, GraphNode]) -> schemas.GraphInvocationDto:
-    node = node_lookup.get(invocation.node_id)
-    model = node_lookup.get(invocation.model_node_id)
+def invocation_dto(invocation: GraphInvocation) -> schemas.GraphInvocationDto:
     return schemas.GraphInvocationDto(
         id=invocation.id,
         graph_run_id=invocation.graph_run_id,
-        node_id=invocation.node_id,
-        model_node_id=invocation.model_node_id,
-        node_title=node.title if node else "Unknown node",
-        model_title=model.title if model else None,
+        kind=invocation.kind,
+        stage_id=invocation.stage_id,
+        candidate_id=invocation.candidate_id,
+        evaluator_id=invocation.evaluator_id,
+        lineage_key=invocation.lineage_key,
+        model_id=invocation.model_id,
         item_key=invocation.item_key,
         stage_index=invocation.stage_index,
         status=invocation.status.value,
@@ -278,6 +163,7 @@ def invocation_dto(invocation: GraphInvocation, node_lookup: dict[int, GraphNode
         output_raw=invocation.output_raw,
         output_json=invocation.output_json,
         error=invocation.error,
+        error_category=invocation.error_category,
         prompt_tokens=invocation.prompt_tokens,
         completion_tokens=invocation.completion_tokens,
         duration_seconds=invocation.duration_seconds,
@@ -293,8 +179,7 @@ def analysis_dto(analysis: GraphRunAnalysis) -> schemas.GraphRunAnalysisDto:
     return schemas.GraphRunAnalysisDto(
         id=analysis.id,
         graph_run_id=analysis.graph_run_id,
-        top_model_node_id=analysis.top_model_node_id,
-        judge_prompt_node_id=analysis.judge_prompt_node_id,
+        evaluator_id=analysis.evaluator_id,
         leaderboard_view=analysis.leaderboard_view,
         top_entity_key=analysis.top_entity_key,
         top_entity_label=analysis.top_entity_label,
@@ -306,37 +191,51 @@ def analysis_dto(analysis: GraphRunAnalysis) -> schemas.GraphRunAnalysisDto:
     )
 
 
-def graph_run_detail(session: Session, run: GraphRun, view_mode: str = "aggregate") -> schemas.GraphRunDetail:
-    graph = require_graph(session, run.graph_id)
-    nodes = graph_nodes(session, graph.id)
-    node_lookup = {node.id: node for node in nodes}
-    invocations = session.exec(
-        select(GraphInvocation)
-        .where(GraphInvocation.graph_run_id == run.id)
-        .order_by(GraphInvocation.stage_index, GraphInvocation.created_at, GraphInvocation.id)
-    ).all()
-    analyses = session.exec(
-        select(GraphRunAnalysis)
-        .where(GraphRunAnalysis.graph_run_id == run.id)
-        .order_by(GraphRunAnalysis.created_at.desc())
-    ).all()
-    progress = graph_native_progress(session, run.id)
-    return schemas.GraphRunDetail(
-        run=graph_run_summary(run),
-        graph=graph_summary(graph),
-        nodes=[node_dto(node) for node in nodes],
-        edges=[edge_dto(edge) for edge in graph_edges(session, graph.id)],
-        progress=progress_dto(progress),
-        node_progress=node_progress(session, nodes, invocations),
-        diagnostics=graph_run_diagnostics(run, progress),
-        leaderboards=leaderboard_groups(session, run, nodes, view_mode),
-        invocations=[invocation_dto(invocation, node_lookup) for invocation in invocations],
-        analyses=[analysis_dto(analysis) for analysis in analyses],
+def pair_dto(pair: GraphPair, judgement: GraphJudgement | None, invocations: dict[int, GraphInvocation]) -> schemas.GraphPairDto:
+    a = invocations.get(pair.a_invocation_id)
+    b = invocations.get(pair.b_invocation_id)
+    return schemas.GraphPairDto(
+        id=pair.id,
+        graph_run_id=pair.graph_run_id,
+        evaluator_id=pair.evaluator_id,
+        target_stage_id=pair.target_stage_id,
+        item_key=pair.item_key,
+        pair_key=pair.pair_key,
+        a_lineage_key=pair.a_lineage_key,
+        b_lineage_key=pair.b_lineage_key,
+        direction=pair.direction,
+        status=pair.status.value,
+        output_a=a.output_raw if a else None,
+        output_b=b.output_raw if b else None,
+        winner=judgement.winner if judgement else None,
+        reasoning=judgement.reasoning if judgement else "",
+        human_reviewer=judgement.human_reviewer if judgement else None,
     )
 
 
-def parse_config_json(config_json: str) -> dict:
-    try:
-        return json.loads(config_json or "{}")
-    except json.JSONDecodeError:
-        return {}
+def human_eval_pairs(session: Session, run_id: int) -> list[schemas.GraphPairDto]:
+    pairs = session.exec(select(GraphPair).where(GraphPair.graph_run_id == run_id)).all()
+    judgements = {judgement.pair_id: judgement for judgement in session.exec(select(GraphJudgement).where(GraphJudgement.evaluator_type == "human_pairwise")).all()}
+    invocation_ids = {pair.a_invocation_id for pair in pairs} | {pair.b_invocation_id for pair in pairs}
+    invocations = {row.id: row for row in session.exec(select(GraphInvocation).where(GraphInvocation.id.in_(invocation_ids))).all()} if invocation_ids else {}
+    return [pair_dto(pair, judgements.get(pair.id), invocations) for pair in pairs]
+
+
+def graph_run_detail(session: Session, run: GraphRun, view_mode: str = "aggregate") -> schemas.GraphRunDetail:
+    graph = require_graph(session, run.graph_id)
+    invocations = session.exec(select(GraphInvocation).where(GraphInvocation.graph_run_id == run.id).order_by(GraphInvocation.stage_index, GraphInvocation.created_at, GraphInvocation.id)).all()
+    analyses = session.exec(select(GraphRunAnalysis).where(GraphRunAnalysis.graph_run_id == run.id).order_by(GraphRunAnalysis.created_at.desc())).all()
+    progress = graph_native_progress(session, run.id)
+    nodes, edges = semantic_nodes_edges(graph)
+    return schemas.GraphRunDetail(
+        run=graph_run_summary(run),
+        graph=graph_summary(graph),
+        nodes=[schemas.SemanticNodeDto(id=node.id, kind=node.kind, title=node.title, x=node.x, y=node.y) for node in nodes],
+        edges=[schemas.SemanticEdgeDto(id=edge["id"], source=edge["source"], target=edge["target"]) for edge in edges],
+        progress=progress_dto(progress),
+        diagnostics=graph_run_diagnostics(run, progress),
+        leaderboards=leaderboard_groups(session, run, view_mode),
+        invocations=[invocation_dto(invocation) for invocation in invocations],
+        human_evals=human_eval_pairs(session, run.id),
+        analyses=[analysis_dto(analysis) for analysis in analyses],
+    )

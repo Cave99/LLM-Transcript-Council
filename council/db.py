@@ -23,15 +23,35 @@ def init_db() -> None:
         graph_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(experimentgraph)").all()}
         if graph_columns and "last_run_id" not in graph_columns:
             connection.execute(text("ALTER TABLE experimentgraph ADD COLUMN last_run_id INTEGER"))
-        graph_node_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphnode)").all()}
-        if graph_node_columns and "width" not in graph_node_columns:
-            connection.execute(text("ALTER TABLE graphnode ADD COLUMN width INTEGER DEFAULT 460"))
-        if graph_node_columns and "height" not in graph_node_columns:
-            connection.execute(text("ALTER TABLE graphnode ADD COLUMN height INTEGER DEFAULT 260"))
+        for column_name, column_type in {
+            "spec_json": "TEXT DEFAULT '{}'",
+            "layout_json": "TEXT DEFAULT '{}'",
+            "spec_hash": "VARCHAR DEFAULT ''",
+        }.items():
+            if graph_columns and column_name not in graph_columns:
+                connection.execute(text(f"ALTER TABLE experimentgraph ADD COLUMN {column_name} {column_type}"))
         graph_run_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphrun)").all()}
         if graph_run_columns and "sample_size" not in graph_run_columns:
             connection.execute(text("ALTER TABLE graphrun ADD COLUMN sample_size INTEGER"))
+        for column_name, column_type in {
+            "spec_snapshot_json": "TEXT DEFAULT '{}'",
+            "prompts_snapshot_json": "TEXT DEFAULT '{}'",
+            "dataset_hash": "VARCHAR DEFAULT ''",
+        }.items():
+            if graph_run_columns and column_name not in graph_run_columns:
+                connection.execute(text(f"ALTER TABLE graphrun ADD COLUMN {column_name} {column_type}"))
         graph_invocation_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphinvocation)").all()}
+        for column_name, column_type in {
+            "kind": "VARCHAR DEFAULT 'generation'",
+            "stage_id": "VARCHAR DEFAULT ''",
+            "candidate_id": "VARCHAR",
+            "evaluator_id": "VARCHAR",
+            "lineage_key": "VARCHAR DEFAULT ''",
+            "model_id": "VARCHAR DEFAULT ''",
+            "error_category": "VARCHAR",
+        }.items():
+            if graph_invocation_columns and column_name not in graph_invocation_columns:
+                connection.execute(text(f"ALTER TABLE graphinvocation ADD COLUMN {column_name} {column_type}"))
         if graph_invocation_columns and "duration_seconds" not in graph_invocation_columns:
             connection.execute(text("ALTER TABLE graphinvocation ADD COLUMN duration_seconds FLOAT"))
         if graph_invocation_columns and "output_tokens_per_second" not in graph_invocation_columns:
@@ -39,33 +59,13 @@ def init_db() -> None:
         graph_analysis_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphrunanalysis)").all()}
         for column_name, column_type in {
             "judge_prompt_node_id": "INTEGER",
+            "evaluator_id": "VARCHAR DEFAULT ''",
             "leaderboard_view": "VARCHAR DEFAULT 'aggregate'",
             "top_entity_key": "VARCHAR DEFAULT ''",
             "top_entity_label": "VARCHAR DEFAULT ''",
         }.items():
             if graph_analysis_columns and column_name not in graph_analysis_columns:
                 connection.execute(text(f"ALTER TABLE graphrunanalysis ADD COLUMN {column_name} {column_type}"))
-        generation_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(generation)").all()}
-        if "started_at" not in generation_columns:
-            connection.execute(text("ALTER TABLE generation ADD COLUMN started_at DATETIME"))
-        run_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(run)").all()}
-        if "pairing_sample_pct" not in run_columns:
-            connection.execute(text("ALTER TABLE run ADD COLUMN pairing_sample_pct FLOAT DEFAULT 100.0"))
-        task_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(task)").all()}
-        if "default_pairing_sample_pct" not in task_columns:
-            connection.execute(text("ALTER TABLE task ADD COLUMN default_pairing_sample_pct FLOAT DEFAULT 100.0"))
-        if "default_swap_enabled" not in task_columns:
-            connection.execute(text("ALTER TABLE task ADD COLUMN default_swap_enabled BOOLEAN DEFAULT 1"))
-        judgement_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(judgement)").all()}
-        for column_name, column_type in {
-            "prompt_tokens": "INTEGER",
-            "completion_tokens": "INTEGER",
-            "cost": "FLOAT",
-            "started_at": "DATETIME",
-            "completed_at": "DATETIME",
-        }.items():
-            if column_name not in judgement_columns:
-                connection.execute(text(f"ALTER TABLE judgement ADD COLUMN {column_name} {column_type}"))
 
 
 def get_session() -> Generator[Session, None, None]:

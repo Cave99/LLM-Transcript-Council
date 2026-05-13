@@ -1,74 +1,71 @@
-"""Graph-native execution for chained prompt stages."""
+"""Spec-backed graph execution, human evaluation, and leaderboards."""
 
 from __future__ import annotations
 
 import asyncio
+import csv
+import hashlib
 import json
 import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from sqlmodel import select
 
-from council.elo import update_elo
-from council.graphs import config, graph_edges, graph_nodes, prompt_inputs
+from council.elo import Winner, consistent_swapped_vote, update_elo
+from council.graph_spec import CandidateSpec, EvaluatorSpec, GraphSpec, StageSpec, dump_spec, parse_spec, validate_spec_payload
 from council.judge import render_template
-from council.json_tools import maybe_repair_json
-from council.models import ExperimentGraph, GraphEdge, GraphInvocation, GraphNode, GraphRun, GraphStatus, Status, utc_now
+from council.json_tools import maybe_repair_json, parse_json_object
+from council.models import ExperimentGraph, GraphInvocation, GraphJudgement, GraphPair, GraphRun, GraphStatus, Status, utc_now
 from council.openrouter import OpenRouterClient
 
 
 @dataclass(frozen=True)
 class DatasetItem:
-    """One dataset row normalized for graph prompt rendering."""
+    """One dataset row normalized for prompt rendering."""
 
     key: str
     values: dict[str, str]
 
 
 @dataclass(frozen=True)
-class RuntimeNode:
-    """Detached graph node data safe to use outside a database session."""
-
-    id: int
-    kind: str
-    title: str
-    body: str
-    config_json: str
-    x: int = 0
-    y: int = 0
-
-
-@dataclass(frozen=True)
-class RuntimeEdge:
-    """Detached graph edge data safe to use outside a database session."""
-
-    from_node_id: int
-    from_socket: str
-    to_node_id: int
-    to_socket: str
-
-
-@dataclass(frozen=True)
 class OutputBranch:
-    """One item-scoped output branch flowing between prompt stages."""
+    """One stage output flowing into later matrix stages."""
 
     item: DatasetItem
-    chain: tuple[int, ...]
+    stage_id: str
+    candidate_id: str
+    candidate_title: str
+    lineage_key: str
     output: str
-    prompt_id: int | None = None
-    stage_index: int = -1
+    invocation_id: int
 
 
 def create_graph_native_run(session, graph_id: int, *, max_concurrency: int = 5, sample_size: int | None = None) -> GraphRun:
-    """Create a resumable graph-native run for chained prompt stages."""
+    """Create a resumable spec-backed run with launch-time snapshots."""
 
     graph = session.get(ExperimentGraph, graph_id)
     if not graph:
         raise ValueError(f"Graph {graph_id} does not exist")
-    run_name = f"{graph.name} test run" if sample_size == 1 else graph.name
-    run = GraphRun(graph_id=graph_id, name=run_name, max_concurrency=max_concurrency, sample_size=sample_size)
+    spec = parse_spec(graph.spec_json)
+    validation = validate_spec_payload(spec.model_dump(mode="json"), check_prompt_paths=True)
+    if not validation.valid:
+        raise ValueError("; ".join(error.message for error in validation.errors))
+    items = dataset_items(spec)
+    effective_sample_size = sample_size or _optional_int(spec.dataset.config.get("sample_size"))
+    if effective_sample_size:
+        items = items[:effective_sample_size]
+    run = GraphRun(
+        graph_id=graph_id,
+        name=f"{graph.name} test run" if sample_size == 1 else graph.name,
+        max_concurrency=max_concurrency,
+        sample_size=sample_size,
+        spec_snapshot_json=dump_spec(spec),
+        prompts_snapshot_json=json.dumps(_prompt_snapshots(spec), sort_keys=True),
+        dataset_hash=_dataset_hash(items),
+    )
     session.add(run)
     graph.status = GraphStatus.running
     session.add(graph)
@@ -78,11 +75,9 @@ def create_graph_native_run(session, graph_id: int, *, max_concurrency: int = 5,
 
 
 def stop_graph_native_run(session, graph_run_id: int) -> GraphRun:
-    """Pause a graph-native run so no new chained calls are scheduled."""
+    """Pause a graph run so no new model calls are scheduled."""
 
-    run = session.get(GraphRun, graph_run_id)
-    if not run:
-        raise ValueError(f"Graph run {graph_run_id} does not exist")
+    run = _require_run(session, graph_run_id)
     run.status = Status.paused
     session.add(run)
     _sync_graph_status(session, run)
@@ -92,12 +87,10 @@ def stop_graph_native_run(session, graph_run_id: int) -> GraphRun:
 
 
 def continue_graph_native_run(session, graph_run_id: int) -> GraphRun:
-    """Mark a resumable graph run ready for the background worker."""
+    """Resume a paused or failed run."""
 
-    run = session.get(GraphRun, graph_run_id)
-    if not run:
-        raise ValueError(f"Graph run {graph_run_id} does not exist")
-    prune_orphaned_graph_failures(session, graph_run_id)
+    run = _require_run(session, graph_run_id)
+    _requeue_unfinished_invocations(session, graph_run_id)
     run.status = Status.pending
     run.error = None
     run.completed_at = None
@@ -109,33 +102,10 @@ def continue_graph_native_run(session, graph_run_id: int) -> GraphRun:
 
 
 def retry_graph_native_failures(session, graph_run_id: int) -> GraphRun:
-    """Requeue failed graph invocations while preserving completed work."""
+    """Requeue failed model invocations while preserving evidence that succeeded."""
 
-    run = session.get(GraphRun, graph_run_id)
-    if not run:
-        raise ValueError(f"Graph run {graph_run_id} does not exist")
-
-    prune_orphaned_graph_failures(session, graph_run_id)
-    failed_invocations = session.exec(
-        select(GraphInvocation).where(
-            GraphInvocation.graph_run_id == graph_run_id,
-            GraphInvocation.status == Status.failed,
-        )
-    ).all()
-    for invocation in failed_invocations:
-        invocation.status = Status.pending
-        invocation.error = None
-        invocation.output_raw = None
-        invocation.output_json = None
-        invocation.prompt_tokens = None
-        invocation.completion_tokens = None
-        invocation.duration_seconds = None
-        invocation.output_tokens_per_second = None
-        invocation.cost = None
-        invocation.started_at = None
-        invocation.completed_at = None
-        session.add(invocation)
-
+    run = _require_run(session, graph_run_id)
+    _requeue_unfinished_invocations(session, graph_run_id)
     run.status = Status.pending
     run.error = None
     run.completed_at = None
@@ -147,7 +117,7 @@ def retry_graph_native_failures(session, graph_run_id: int) -> GraphRun:
 
 
 async def execute_graph_native_run(graph_run_id: int, session_factory, client: OpenRouterClient | None = None) -> None:
-    """Run chained prompt stages over each dataset item and model node."""
+    """Execute a spec snapshot over dataset items and evaluators."""
 
     client = client or OpenRouterClient()
     if not client.api_key:
@@ -162,102 +132,52 @@ async def execute_graph_native_run(graph_run_id: int, session_factory, client: O
         raise RuntimeError("OPENROUTER_API_KEY is not set")
 
     with session_factory() as session:
-        run = session.get(GraphRun, graph_run_id)
+        run = _require_run(session, graph_run_id)
         run.status = Status.running
         run.started_at = run.started_at or utc_now()
         session.add(run)
         session.commit()
+        spec = parse_spec(run.spec_snapshot_json)
         max_concurrency = run.max_concurrency
-        progress = graph_native_progress(session, graph_run_id)
-        nodes = [_runtime_node(node) for node in graph_nodes(session, run.graph_id)]
-        edges = [_runtime_edge(edge) for edge in graph_edges(session, run.graph_id)]
-        items = dataset_items(nodes)
-        if run.sample_size:
-            items = items[: run.sample_size]
-        prompt_stages = sorted([node for node in nodes if node.kind == "prompt"], key=lambda node: (node.x, node.y, node.id or 0))
-        judge_prompts = sorted([node for node in nodes if node.kind == "judge"], key=lambda node: (node.x, node.y, node.id or 0))
-        model_nodes = [node for node in nodes if node.kind == "model" and config(node).get("role") == "generator" and config(node).get("model_id", "").strip()]
-        judge_models = [node for node in nodes if node.kind == "model" and config(node).get("role") == "judge" and config(node).get("model_id", "").strip()]
-        constants = {config(node).get("socket", node.title): node.body for node in nodes if node.kind == "constant"}
-        print(
-            f"[graph run {graph_run_id}] Worker started: "
-            f"{progress['complete']}/{progress['total']} complete, "
-            f"{progress['pending']} pending, {progress['failed']} failed.",
-            flush=True,
-        )
-        preflight_error = _graph_preflight_error(items, prompt_stages, model_nodes, judge_prompts, judge_models)
-        if preflight_error:
-            run.status = Status.failed
-            run.error = preflight_error
-            run.completed_at = utc_now()
-            session.add(run)
-            _sync_graph_status(session, run)
-            session.commit()
-            return
+        items = dataset_items(spec)
+        effective_sample_size = run.sample_size or _optional_int(spec.dataset.config.get("sample_size"))
+        if effective_sample_size:
+            items = items[:effective_sample_size]
 
     semaphore = asyncio.Semaphore(max_concurrency)
-    branches = [OutputBranch(item=item, chain=(), output="") for item in items]
-    stage_outputs: dict[int, list[OutputBranch]] = {}
-    for stage_index, prompt in enumerate(prompt_stages):
+    constants = {key: str(value) for key, value in spec.constants.items()}
+    branches: list[OutputBranch] = []
+    stage_outputs: dict[str, list[OutputBranch]] = {}
+
+    for stage_index, stage in enumerate(spec.stages):
         with session_factory() as session:
             run = session.get(GraphRun, graph_run_id)
             if run and run.status == Status.paused:
                 _sync_graph_status(session, run)
                 session.commit()
                 return
+        input_branches: list[OutputBranch | None] = branches if branches else [None]
         tasks = []
-        prompt_models = _connected_models(prompt, model_nodes, edges)
-        for branch in branches:
-            for model in prompt_models:
-                tasks.append(
-                    _run_invocation(
-                        graph_run_id,
-                        stage_index,
-                        prompt,
-                        model,
-                        branch,
-                        constants,
-                        nodes,
-                        edges,
-                        session_factory,
-                        client,
-                        semaphore,
-                    )
-                )
+        for item in items:
+            scoped_inputs = [branch for branch in input_branches if branch is None or branch.item.key == item.key]
+            for input_branch in scoped_inputs:
+                for candidate in stage.candidates:
+                    tasks.append(_run_generation_invocation(graph_run_id, stage_index, stage, candidate, item, input_branch, constants, session_factory, client, semaphore))
         results = await asyncio.gather(*tasks)
-        branches = [branch for branch in results if branch.output]
-        stage_outputs[prompt.id] = branches
+        branches = [branch for branch in results if branch is not None and branch.output]
+        stage_outputs[stage.id] = branches
 
-    for judge_prompt in judge_prompts:
-        target_prompt = _judge_target_prompt(judge_prompt, prompt_stages, model_nodes, edges)
-        target_branches = stage_outputs.get(target_prompt.id if target_prompt else -1, branches)
-        if not target_prompt:
+    for evaluator in spec.evaluators:
+        target_outputs = stage_outputs.get(evaluator.target_stage, [])
+        if evaluator.type == "human_pairwise":
+            with session_factory() as session:
+                _ensure_pairs(session, graph_run_id, evaluator, target_outputs)
             continue
-        tasks = []
-        scoped_judge_models = _connected_models(judge_prompt, judge_models, edges)
-        branches_by_item: dict[str, list[OutputBranch]] = {}
-        for branch in target_branches:
-            branches_by_item.setdefault(branch.item.key, []).append(branch)
-        for item_branches in branches_by_item.values():
-            branch_pairs = [(a, b) for index, a in enumerate(item_branches) for b in item_branches[index + 1 :]]
-            for branch_a, branch_b in branch_pairs:
-                for judge_model in scoped_judge_models:
-                    tasks.append(
-                        _run_judge_invocation(
-                            graph_run_id,
-                            judge_prompt,
-                            target_prompt,
-                            judge_model,
-                            constants,
-                            nodes,
-                            edges,
-                            branch_a,
-                            branch_b,
-                            session_factory,
-                            client,
-                            semaphore,
-                        )
-                    )
+        pairs = []
+        with session_factory() as session:
+            pairs = _ensure_pairs(session, graph_run_id, evaluator, target_outputs)
+        stage_output_mode = next((item.upstream_output for item in spec.stages if item.id == evaluator.target_stage), "raw")
+        tasks = [_run_llm_judge_pair(graph_run_id, evaluator, pair.id, constants, stage_output_mode, session_factory, client, semaphore) for pair in pairs]
         if tasks:
             await asyncio.gather(*tasks)
 
@@ -266,91 +186,25 @@ async def execute_graph_native_run(graph_run_id: int, session_factory, client: O
 
 
 def finish_graph_native_run(session, graph_run_id: int) -> GraphRun | None:
-    """Finalize a graph run only when no invocation rows remain unfinished."""
+    """Finalize model execution once no model invocation is pending or running."""
 
     run = session.get(GraphRun, graph_run_id)
     if not run or run.status == Status.paused:
         return run
     progress = graph_native_progress(session, graph_run_id)
-    if progress["pending"] or progress["running"]:
-        stale_count = prune_unfinished_graph_invocations(session, graph_run_id)
-        if stale_count:
-            print(f"[graph run {graph_run_id}] Pruned {stale_count} stale unfinished invocation rows.", flush=True)
-        progress = graph_native_progress(session, graph_run_id)
-    if progress["pending"] or progress["running"]:
-        run.status = Status.pending
-        run.completed_at = None
-    else:
-        run.status = Status.complete
-        run.completed_at = utc_now()
+    run.status = Status.failed if progress["failed"] else Status.complete
+    run.completed_at = utc_now()
+    if progress["failed"]:
+        run.error = f"{progress['failed']} model call(s) failed."
     session.add(run)
     _sync_graph_status(session, run)
     session.commit()
     session.refresh(run)
-    final_progress = graph_native_progress(session, graph_run_id)
-    print(
-        f"[graph run {graph_run_id}] Worker finished with status={run.status.value}: "
-        f"{final_progress['complete']}/{final_progress['total']} complete, "
-        f"{final_progress['pending']} pending, {final_progress['failed']} failed.",
-        flush=True,
-    )
     return run
 
 
-def prune_unfinished_graph_invocations(session, graph_run_id: int) -> int:
-    """Remove pending rows left behind by older topology or target-stage plans."""
-
-    stale_rows = session.exec(
-        select(GraphInvocation)
-        .where(GraphInvocation.graph_run_id == graph_run_id)
-        .where(GraphInvocation.status.in_([Status.pending, Status.running]))
-    ).all()
-    for invocation in stale_rows:
-        print(
-            f"[graph run {graph_run_id}] STALE INVOCATION PRUNED: "
-            f"node_id={invocation.node_id} model_node_id={invocation.model_node_id} item={invocation.item_key!r}",
-            flush=True,
-        )
-        session.delete(invocation)
-    session.flush()
-    return len(stale_rows)
-
-
-def prune_orphaned_graph_failures(session, graph_run_id: int) -> int:
-    """Remove synthetic orphaned failures produced by older resume attempts."""
-
-    marker = "Worker exited without reaching this invocation"
-    stale_rows = session.exec(
-        select(GraphInvocation)
-        .where(GraphInvocation.graph_run_id == graph_run_id)
-        .where(GraphInvocation.status == Status.failed)
-        .where(GraphInvocation.error.like(f"{marker}%"))
-    ).all()
-    for invocation in stale_rows:
-        print(
-            f"[graph run {graph_run_id}] STALE ORPHANED FAILURE PRUNED: "
-            f"node_id={invocation.node_id} model_node_id={invocation.model_node_id} item={invocation.item_key!r}",
-            flush=True,
-        )
-        session.delete(invocation)
-    session.flush()
-    return len(stale_rows)
-
-
-def dataset_items(nodes: list[GraphNode | RuntimeNode]) -> list[DatasetItem]:
-    """Load markdown or CSV dataset items for graph-native execution."""
-
-    dataset = next((node for node in nodes if node.kind == "dataset"), None)
-    if not dataset:
-        return []
-    cfg = config(dataset)
-    if cfg.get("source_type", "markdown") == "csv":
-        return _csv_items(cfg)
-    return _markdown_items(cfg)
-
-
 def graph_native_progress(session, graph_run_id: int) -> dict[str, int]:
-    """Count graph-native invocations for progress displays."""
+    """Count model-call invocations for progress displays."""
 
     rows = session.exec(select(GraphInvocation).where(GraphInvocation.graph_run_id == graph_run_id)).all()
     return {
@@ -362,640 +216,456 @@ def graph_native_progress(session, graph_run_id: int) -> dict[str, int]:
     }
 
 
-def _render_values_for_node(
-    target: RuntimeNode,
-    item: DatasetItem,
-    constants: dict[str, str],
-    nodes: list[RuntimeNode],
-    edges: list[RuntimeEdge],
-    *,
-    previous_output: str = "",
-) -> dict[str, str]:
-    """Build prompt values from actual graph edges, then fall back to common names."""
+def submit_human_judgement(session, graph_run_id: int, pair_id: int, *, winner: str, reasoning: str = "", human_reviewer: str = "") -> GraphJudgement:
+    """Complete or update one human pairwise judgement."""
 
-    by_id = {node.id: node for node in nodes}
-    values = {
-        **item.values,
-        **constants,
-        "input": item.values.get("transcript", ""),
-        "previous_output": previous_output,
-    }
-    for edge in edges:
-        if edge.to_node_id != target.id:
+    pair = session.get(GraphPair, pair_id)
+    if not pair or pair.graph_run_id != graph_run_id:
+        raise ValueError(f"Pair {pair_id} does not exist for run {graph_run_id}")
+    winner = winner.upper()
+    if winner not in {"A", "B", "TIE"}:
+        raise ValueError("winner must be A, B, or TIE")
+    judgement = session.exec(select(GraphJudgement).where(GraphJudgement.pair_id == pair_id, GraphJudgement.evaluator_type == "human_pairwise")).first()
+    if not judgement:
+        judgement = GraphJudgement(pair_id=pair_id, evaluator_type="human_pairwise")
+    judgement.winner = winner
+    judgement.reasoning = reasoning.strip()
+    judgement.human_reviewer = human_reviewer.strip() or None
+    judgement.updated_at = utc_now()
+    pair.status = Status.complete
+    session.add(pair)
+    session.add(judgement)
+    session.commit()
+    session.refresh(judgement)
+    return judgement
+
+
+def graph_run_leaderboards(session, graph_run_id: int, _nodes=None, *, view_mode: str = "aggregate", target_stage_id: str = "", evaluator_type: str = "") -> list[dict[str, Any]]:
+    """Compute one terminal-candidate ELO leaderboard from completed judgements."""
+
+    pairs = {pair.id: pair for pair in session.exec(select(GraphPair).where(GraphPair.graph_run_id == graph_run_id)).all()}
+    judgements = session.exec(select(GraphJudgement)).all()
+    spec = _run_spec(session, graph_run_id)
+    candidate_labels = {candidate.id: candidate.title or candidate.id for stage in spec.stages for candidate in stage.candidates}
+    ratings: dict[str, float] = {}
+    records: dict[str, dict[str, int]] = {}
+    favorites: dict[str, set[str]] = {}
+    for judgement in judgements:
+        pair = pairs.get(judgement.pair_id)
+        if not pair or pair.graph_run_id != graph_run_id or not judgement.winner:
             continue
-        source = by_id.get(edge.from_node_id)
-        if not source:
+        if target_stage_id and pair.target_stage_id != target_stage_id:
             continue
-        edge_value = _edge_value(source, edge.from_socket, item, constants, previous_output)
-        if edge_value is not None:
-            values[edge.to_socket] = edge_value
-    return values
-
-
-def _edge_value(source: RuntimeNode, socket: str, item: DatasetItem, constants: dict[str, str], previous_output: str) -> str | None:
-    """Resolve the value carried by one incoming edge."""
-
-    if source.kind == "constant":
-        return source.body
-    if source.kind == "dataset":
-        if socket in item.values:
-            return item.values[socket]
-        if socket == "row_json":
-            import json
-
-            return json.dumps(item.values, sort_keys=True)
-        return None
-    if source.kind == "prompt":
-        if socket in {"full_prompt", "template"}:
-            return source.body
-        return previous_output
-    return constants.get(socket)
-
-
-def _runtime_node(node: GraphNode) -> RuntimeNode:
-    """Copy graph node fields before the SQLModel session expires them."""
-
-    return RuntimeNode(
-        id=node.id,
-        kind=node.kind,
-        title=node.title,
-        body=node.body,
-        config_json=node.config_json,
-        x=node.x,
-        y=node.y,
-    )
-
-
-def _runtime_edge(edge: GraphEdge) -> RuntimeEdge:
-    """Copy graph edge fields before the SQLModel session expires them."""
-
-    return RuntimeEdge(
-        from_node_id=edge.from_node_id,
-        from_socket=edge.from_socket,
-        to_node_id=edge.to_node_id,
-        to_socket=edge.to_socket,
-    )
-
-
-def _graph_preflight_error(
-    items: list[DatasetItem],
-    prompt_stages: list[RuntimeNode],
-    model_nodes: list[RuntimeNode],
-    judge_prompts: list[RuntimeNode],
-    judge_models: list[RuntimeNode],
-) -> str | None:
-    """Explain why a graph run would create zero invocation rows."""
-
-    if not items:
-        return "No dataset items were selected. Check the dataset node path, source type, and sample size."
-    if not prompt_stages:
-        return "No prompt nodes are configured, so there is nothing to run."
-    if not model_nodes:
-        return "No generator model nodes have a model ID configured."
-    if judge_prompts and not judge_models:
-        return "A judge prompt exists, but no judge model nodes have a model ID configured."
-    return None
-
-
-def _branch_input_key(branch: OutputBranch) -> str:
-    """Keep resumed invocation rows distinct for each upstream branch."""
-
-    if not branch.chain:
-        return branch.item.key
-    return f"{branch.item.key}|{_chain_key(branch.chain)}"
-
-
-def _chain_key(chain: tuple[int, ...]) -> str:
-    return ">".join(str(node_id) for node_id in chain)
-
-
-def _judge_target_prompt(judge_prompt: RuntimeNode, prompt_stages: list[RuntimeNode], model_nodes: list[RuntimeNode], edges: list[RuntimeEdge]) -> RuntimeNode | None:
-    """Find the prompt stage a judge is visually connected to."""
-
-    prompt_by_id = {prompt.id: prompt for prompt in prompt_stages}
-    incoming_prompt_ids = [
-        edge.from_node_id
-        for edge in edges
-        if edge.to_node_id == judge_prompt.id and edge.from_node_id in prompt_by_id
-    ]
-    if incoming_prompt_ids:
-        return prompt_by_id[incoming_prompt_ids[-1]]
-    model_ids = {node.id for node in model_nodes}
-    incoming_model_ids = [
-        edge.from_node_id
-        for edge in edges
-        if edge.to_node_id == judge_prompt.id and edge.from_node_id in model_ids
-    ]
-    if incoming_model_ids:
-        prompt_ids = [
-            edge.from_node_id
-            for edge in edges
-            if edge.to_node_id in incoming_model_ids and edge.from_node_id in prompt_by_id
-        ]
-        if prompt_ids:
-            return prompt_by_id[prompt_ids[-1]]
-    return prompt_stages[-1] if prompt_stages else None
-
-
-def _connected_models(source: RuntimeNode, candidates: list[RuntimeNode], edges: list[RuntimeEdge]) -> list[RuntimeNode]:
-    """Return model nodes visually connected from a prompt or judge node."""
-
-    candidate_by_id = {node.id: node for node in candidates}
-    connected_ids = [
-        edge.to_node_id
-        for edge in edges
-        if edge.from_node_id == source.id and edge.to_node_id in candidate_by_id
-    ]
-    if not connected_ids:
-        return candidates
-    seen = set()
-    scoped = []
-    for node_id in connected_ids:
-        if node_id in seen:
+        if evaluator_type and judgement.evaluator_type != evaluator_type:
             continue
-        seen.add(node_id)
-        scoped.append(candidate_by_id[node_id])
-    return scoped
+        entity_a = _terminal_candidate(pair.a_lineage_key)
+        entity_b = _terminal_candidate(pair.b_lineage_key)
+        if not entity_a or not entity_b or entity_a == entity_b:
+            continue
+        winner: Winner = judgement.winner if judgement.winner in {"A", "B", "TIE"} else "TIE"  # type: ignore[assignment]
+        if pair.direction == "swapped":
+            winner = "B" if winner == "A" else "A" if winner == "B" else "TIE"
+        ratings.setdefault(entity_a, 1500.0)
+        ratings.setdefault(entity_b, 1500.0)
+        records.setdefault(entity_a, {"wins": 0, "losses": 0, "ties": 0})
+        records.setdefault(entity_b, {"wins": 0, "losses": 0, "ties": 0})
+        ratings[entity_a], ratings[entity_b] = update_elo(ratings[entity_a], ratings[entity_b], winner)
+        if winner == "A":
+            records[entity_a]["wins"] += 1
+            records[entity_b]["losses"] += 1
+            favorites.setdefault(entity_a, set()).add(pair.evaluator_id)
+        elif winner == "B":
+            records[entity_b]["wins"] += 1
+            records[entity_a]["losses"] += 1
+            favorites.setdefault(entity_b, set()).add(pair.evaluator_id)
+        else:
+            records[entity_a]["ties"] += 1
+            records[entity_b]["ties"] += 1
+    rows = [
+        {
+            "entity_key": key,
+            "label": candidate_labels.get(key, key),
+            "node_id": None,
+            "rating": rating,
+            "wins": records.get(key, {}).get("wins", 0),
+            "losses": records.get(key, {}).get("losses", 0),
+            "ties": records.get(key, {}).get("ties", 0),
+            "avg_tokens": "n/a",
+            "favorites": [{"id": index, "title": title} for index, title in enumerate(sorted(favorites.get(key, set())), start=1)],
+        }
+        for key, rating in sorted(ratings.items(), key=lambda item: item[1], reverse=True)
+    ]
+    return [{"title": "ELO Leaderboard", "judge_prompt_node_id": None, "view_mode": view_mode, "rows": rows}]
 
 
-def _leaderboard_entity_key(branch: OutputBranch, _prompt: RuntimeNode) -> str:
-    """Persist the full model chain so leaderboard views can aggregate later."""
+def graph_run_leaderboard(session, graph_run_id: int, nodes=None) -> list[dict[str, Any]]:
+    """Compatibility wrapper for analysis code."""
 
-    if not branch.chain:
-        return ""
-    return _chain_key(branch.chain)
-
-
-def _leaderboard_entity_label(branch: OutputBranch, prompt: RuntimeNode, nodes: list[RuntimeNode]) -> str:
-    """Return the human label for a leaderboard entity."""
-
-    by_id = {node.id: node for node in nodes}
-    entity_key = _leaderboard_entity_key(branch, prompt)
-    if not entity_key:
-        return "Unknown"
-    return " -> ".join(by_id.get(node_id).title if by_id.get(node_id) else str(node_id) for node_id in branch.chain)
+    groups = graph_run_leaderboards(session, graph_run_id, nodes)
+    return groups[0]["rows"] if groups else []
 
 
-async def _run_invocation(
-    graph_run_id: int,
-    stage_index: int,
-    prompt: GraphNode,
-    model: GraphNode,
-    branch: OutputBranch,
-    constants: dict[str, str],
-    nodes: list[RuntimeNode],
-    edges: list[RuntimeEdge],
-    session_factory,
-    client: OpenRouterClient,
-    semaphore: asyncio.Semaphore,
-) -> OutputBranch:
-    model_cfg = config(model)
-    prompt_cfg = config(prompt)
-    item_key = _branch_input_key(branch)
-    values = _render_values_for_node(prompt, branch.item, constants, nodes, edges, previous_output=branch.output)
-    rendered = render_template(prompt.body, values)
-    unresolved = prompt_inputs(rendered)
-    with session_factory() as session:
-        run = session.get(GraphRun, graph_run_id)
-        if run and run.status == Status.paused:
-            return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output="", prompt_id=prompt.id, stage_index=stage_index)
-        existing = session.exec(
-            select(GraphInvocation).where(
-                GraphInvocation.graph_run_id == graph_run_id,
-                GraphInvocation.node_id == prompt.id,
-                GraphInvocation.model_node_id == model.id,
-                GraphInvocation.item_key == item_key,
-                GraphInvocation.stage_index == stage_index,
-            )
-        ).first()
-        if existing and existing.status == Status.complete:
-            output = existing.output_json if prompt_cfg.get("upstream_mode") == "json" else existing.output_raw
-            return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output=output or "", prompt_id=prompt.id, stage_index=stage_index)
-        invocation = existing or GraphInvocation(
-            graph_run_id=graph_run_id,
-            node_id=prompt.id,
-            model_node_id=model.id,
-            item_key=item_key,
-            stage_index=stage_index,
-        )
-        invocation.status = Status.running
-        invocation.rendered_prompt = rendered
-        if unresolved:
-            invocation.status = Status.failed
-            invocation.error = f"Unresolved prompt inputs after edge rendering: {', '.join(unresolved)}"
-            _log_invocation_failure("generator", graph_run_id, prompt.title, model.title, item_key, invocation.error)
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-            return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output="", prompt_id=prompt.id, stage_index=stage_index)
-        invocation.started_at = utc_now()
-        invocation.error = None
-        session.add(invocation)
-        session.commit()
-        invocation_id = invocation.id
+def dataset_items(spec: GraphSpec) -> list[DatasetItem]:
+    """Load markdown-folder or CSV dataset items."""
 
-    try:
-        async with semaphore:
-            call_started = time.perf_counter()
-            response = await client.chat(
-                model=model_cfg.get("model_id", ""),
-                temperature=float(model_cfg.get("temperature") or 0.0),
-                reasoning_effort=model_cfg.get("reasoning_effort") if model_cfg.get("reasoning_supported") else None,
-                retries=int(model_cfg.get("retry_count") or 2),
-                messages=[{"role": "user", "content": rendered}],
-            )
-            duration = max(time.perf_counter() - call_started, 0.001)
-        repaired = maybe_repair_json(response.text)
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.complete
-            invocation.output_raw = response.text
-            invocation.output_json = repaired
-            invocation.prompt_tokens = response.prompt_tokens
-            invocation.completion_tokens = response.completion_tokens
-            invocation.duration_seconds = duration
-            invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
-            invocation.cost = response.cost
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-        return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output=repaired if prompt_cfg.get("upstream_mode") == "json" else response.text, prompt_id=prompt.id, stage_index=stage_index)
-    except Exception as exc:
-        error = str(exc)
-        _log_invocation_failure("generator", graph_run_id, prompt.title, model.title, item_key, error, exc)
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.failed
-            invocation.error = error
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-        return OutputBranch(item=branch.item, chain=branch.chain + (model.id,), output="", prompt_id=prompt.id, stage_index=stage_index)
-
-
-async def _run_judge_invocation(
-    graph_run_id: int,
-    judge_prompt: GraphNode,
-    target_prompt: GraphNode,
-    judge_model: GraphNode,
-    constants: dict[str, str],
-    nodes: list[RuntimeNode],
-    edges: list[RuntimeEdge],
-    branch_a: OutputBranch,
-    branch_b: OutputBranch,
-    session_factory,
-    client: OpenRouterClient,
-    semaphore: asyncio.Semaphore,
-) -> None:
-    model_cfg = config(judge_model)
-    values = {
-        **_render_values_for_node(judge_prompt, branch_a.item, constants, nodes, edges),
-        "output_a": branch_a.output,
-        "output_b": branch_b.output,
-        "model_a": _leaderboard_entity_label(branch_a, target_prompt, nodes),
-        "model_b": _leaderboard_entity_label(branch_b, target_prompt, nodes),
-    }
-    rendered = render_template(judge_prompt.body, values)
-    unresolved = prompt_inputs(rendered)
-    item_key = f"{branch_a.item.key}:{_leaderboard_entity_key(branch_a, target_prompt)}-vs-{_leaderboard_entity_key(branch_b, target_prompt)}"
-    with session_factory() as session:
-        existing = session.exec(
-            select(GraphInvocation).where(
-                GraphInvocation.graph_run_id == graph_run_id,
-                GraphInvocation.node_id == judge_prompt.id,
-                GraphInvocation.model_node_id == judge_model.id,
-                GraphInvocation.item_key == item_key,
-                GraphInvocation.stage_index == 10_000,
-            )
-        ).first()
-        if existing and existing.status == Status.complete:
-            return
-        invocation = existing or GraphInvocation(
-            graph_run_id=graph_run_id,
-            node_id=judge_prompt.id,
-            model_node_id=judge_model.id,
-            item_key=item_key,
-            stage_index=10_000,
-        )
-        invocation.status = Status.running
-        invocation.rendered_prompt = rendered
-        if unresolved:
-            invocation.status = Status.failed
-            invocation.error = f"Unresolved judge prompt inputs after edge rendering: {', '.join(unresolved)}"
-            _log_invocation_failure("judge", graph_run_id, judge_prompt.title, judge_model.title, item_key, invocation.error)
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-            return
-        invocation.started_at = utc_now()
-        invocation.error = None
-        session.add(invocation)
-        session.commit()
-        invocation_id = invocation.id
-    try:
-        async with semaphore:
-            call_started = time.perf_counter()
-            response = await client.chat(
-                model=model_cfg.get("model_id", ""),
-                temperature=float(model_cfg.get("temperature") or 0.0),
-                reasoning_effort=model_cfg.get("reasoning_effort") if model_cfg.get("reasoning_supported") else None,
-                retries=int(model_cfg.get("retry_count") or 2),
-                messages=[{"role": "user", "content": rendered}],
-            )
-            duration = max(time.perf_counter() - call_started, 0.001)
-        repaired = maybe_repair_json(response.text)
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.complete
-            invocation.output_raw = response.text
-            invocation.output_json = repaired
-            invocation.prompt_tokens = response.prompt_tokens
-            invocation.completion_tokens = response.completion_tokens
-            invocation.duration_seconds = duration
-            invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
-            invocation.cost = response.cost
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-    except Exception as exc:
-        error = str(exc)
-        _log_invocation_failure("judge", graph_run_id, judge_prompt.title, judge_model.title, item_key, error, exc)
-        with session_factory() as session:
-            invocation = session.get(GraphInvocation, invocation_id)
-            invocation.status = Status.failed
-            invocation.error = error
-            invocation.completed_at = utc_now()
-            session.add(invocation)
-            session.commit()
-
-
-def _log_invocation_failure(
-    kind: str,
-    graph_run_id: int,
-    prompt_title: str,
-    model_title: str,
-    item_key: str,
-    error: str,
-    exc: Exception | None = None,
-) -> None:
-    """Print invocation failures where local run operators can see them."""
-
-    print(
-        f"[graph run {graph_run_id}] INVOCATION FAILED: "
-        f"kind={kind} prompt={prompt_title!r} model={model_title!r} item={item_key!r}: {error}",
-        flush=True,
-    )
-    if exc:
-        print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), flush=True)
-
-
-def _markdown_items(cfg: dict) -> list[DatasetItem]:
-    root = Path(cfg.get("path", "")).expanduser()
+    cfg = spec.dataset.config
+    if spec.dataset.provider == "csv":
+        path = Path(str(cfg.get("path") or ""))
+        if not path.exists():
+            return []
+        id_column = str(cfg.get("id_column") or "call_id")
+        text_column = str(cfg.get("text_column") or "transcript")
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        items = []
+        for index, row in enumerate(rows):
+            values = {key: str(value or "") for key, value in row.items()}
+            if text_column in values:
+                values["transcript"] = values[text_column]
+            items.append(DatasetItem(key=values.get(id_column) or f"row_{index + 1}", values=values))
+        return items
+    root = Path(str(cfg.get("path") or "transcripts"))
     if not root.exists():
         return []
-    paths = sorted(path for path in root.rglob("*.md") if path.is_file())
-    limit = int(cfg.get("sample_size") or 0)
-    if limit:
-        paths = paths[:limit]
-    return [
-        DatasetItem(
-            key=path.stem,
-            values={"call_id": path.stem, "transcript": path.read_text(encoding="utf-8")},
-        )
-        for path in paths
-    ]
-
-
-def _csv_items(cfg: dict) -> list[DatasetItem]:
-    import csv
-
-    path = Path(cfg.get("path", "")).expanduser()
-    if not path.exists():
-        return []
-    id_column = cfg.get("id_column") or "call_id"
-    text_column = cfg.get("text_column") or "transcript"
-    with path.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(handle))
-    limit = int(cfg.get("sample_size") or 0)
-    if limit:
-        rows = rows[:limit]
     items = []
-    for index, row in enumerate(rows):
-        key = row.get(id_column) or f"row-{index + 1}"
-        values = {name: value or "" for name, value in row.items()}
-        values.setdefault("call_id", key)
-        values["transcript"] = row.get(text_column, "")
-        items.append(DatasetItem(key=key, values=values))
+    for path in sorted([p for p in root.iterdir() if p.suffix.lower() in {".md", ".txt"}]):
+        items.append(DatasetItem(key=path.stem, values={"call_id": path.stem, "transcript": path.read_text(encoding="utf-8")}))
     return items
+
+
+async def _run_generation_invocation(
+    graph_run_id: int,
+    stage_index: int,
+    stage: StageSpec,
+    candidate: CandidateSpec,
+    item: DatasetItem,
+    input_branch: OutputBranch | None,
+    constants: dict[str, str],
+    session_factory,
+    client: OpenRouterClient,
+    semaphore: asyncio.Semaphore,
+) -> OutputBranch | None:
+    previous_output = input_branch.output if input_branch else ""
+    lineage_key = f"{input_branch.lineage_key}->{candidate.id}" if input_branch else candidate.id
+    template = _prompt_text(candidate.prompt_path, candidate.prompt_inline)
+    rendered = render_template(template, {**item.values, **constants, "previous_output": previous_output})
+    unresolved = _unresolved_inputs(rendered)
+    with session_factory() as session:
+        existing = session.exec(
+            select(GraphInvocation).where(
+                GraphInvocation.graph_run_id == graph_run_id,
+                GraphInvocation.kind == "generation",
+                GraphInvocation.stage_id == stage.id,
+                GraphInvocation.candidate_id == candidate.id,
+                GraphInvocation.item_key == item.key,
+                GraphInvocation.lineage_key == lineage_key,
+            )
+        ).first()
+        if existing and existing.status == Status.complete:
+            return OutputBranch(
+                item=item,
+                stage_id=stage.id,
+                candidate_id=candidate.id,
+                candidate_title=candidate.title or candidate.id,
+                lineage_key=lineage_key,
+                output=existing.output_json if stage.upstream_output == "json" and existing.output_json else existing.output_raw or "",
+                invocation_id=existing.id,
+            )
+        invocation = existing or GraphInvocation(graph_run_id=graph_run_id, kind="generation", stage_id=stage.id, candidate_id=candidate.id, item_key=item.key, lineage_key=lineage_key, stage_index=stage_index, model_id=candidate.model)
+        invocation.status = Status.running
+        invocation.rendered_prompt = rendered
+        invocation.error = None
+        invocation.error_category = None
+        if unresolved:
+            invocation.status = Status.failed
+            invocation.error = f"Unresolved prompt inputs: {', '.join(unresolved)}"
+            invocation.error_category = "unresolved_template"
+            invocation.completed_at = utc_now()
+            session.add(invocation)
+            session.commit()
+            return None
+        invocation.started_at = utc_now()
+        session.add(invocation)
+        session.commit()
+        invocation_id = invocation.id
+    try:
+        async with semaphore:
+            started = time.perf_counter()
+            response = await client.chat(model=candidate.model, temperature=candidate.params.temperature, reasoning_effort=candidate.params.reasoning_effort, retries=candidate.params.retry_count, messages=[{"role": "user", "content": rendered}])
+            duration = max(time.perf_counter() - started, 0.001)
+        repaired = maybe_repair_json(response.text)
+        output_text = response.text
+        output_json = repaired
+        if stage.upstream_output == "json":
+            try:
+                parsed = parse_json_object(repaired)
+            except Exception as exc:  # noqa: BLE001
+                with session_factory() as session:
+                    invocation = session.get(GraphInvocation, invocation_id)
+                    invocation.status = Status.failed
+                    invocation.output_raw = response.text
+                    invocation.output_json = repaired
+                    invocation.error = f"Invalid JSON output for {stage.id}: {exc}"
+                    invocation.error_category = "invalid_json_output"
+                    invocation.completed_at = utc_now()
+                    session.add(invocation)
+                    session.commit()
+                print(f"[graph run {graph_run_id}] invalid JSON output: {response.text}", flush=True)
+                return None
+            output_json = json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+            output_text = output_json
+        with session_factory() as session:
+            invocation = session.get(GraphInvocation, invocation_id)
+            invocation.status = Status.complete
+            invocation.output_raw = response.text
+            invocation.output_json = output_json
+            invocation.prompt_tokens = response.prompt_tokens
+            invocation.completion_tokens = response.completion_tokens
+            invocation.duration_seconds = duration
+            invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
+            invocation.cost = response.cost
+            invocation.completed_at = utc_now()
+            session.add(invocation)
+            session.commit()
+            return OutputBranch(item=item, stage_id=stage.id, candidate_id=candidate.id, candidate_title=candidate.title or candidate.id, lineage_key=lineage_key, output=output_text, invocation_id=invocation_id)
+    except Exception as exc:  # noqa: BLE001
+        with session_factory() as session:
+            invocation = session.get(GraphInvocation, invocation_id)
+            invocation.status = Status.failed
+            invocation.error = str(exc)
+            invocation.error_category = _error_category(exc)
+            invocation.completed_at = utc_now()
+            session.add(invocation)
+            session.commit()
+        print(f"[graph run {graph_run_id}] generation failed: {traceback.format_exc()}", flush=True)
+        return None
+
+
+def _ensure_pairs(session, graph_run_id: int, evaluator: EvaluatorSpec, outputs: list[OutputBranch]) -> list[GraphPair]:
+    by_item: dict[str, list[OutputBranch]] = {}
+    for output in outputs:
+        by_item.setdefault(output.item.key, []).append(output)
+    created_or_existing: list[GraphPair] = []
+    for item_outputs in by_item.values():
+        pairs = [(a, b) for index, a in enumerate(item_outputs) for b in item_outputs[index + 1 :]]
+        pairs = _sample_pairs(pairs, evaluator.pairing.sample_pct)
+        for a, b in pairs:
+            directions = ["normal", "swapped"] if evaluator.pairing.swap else ["normal"]
+            for direction in directions:
+                first, second = (b, a) if direction == "swapped" else (a, b)
+                pair_key = f"{first.lineage_key}-vs-{second.lineage_key}"
+                existing = session.exec(
+                    select(GraphPair).where(
+                        GraphPair.graph_run_id == graph_run_id,
+                        GraphPair.evaluator_id == evaluator.id,
+                        GraphPair.target_stage_id == evaluator.target_stage,
+                        GraphPair.item_key == first.item.key,
+                        GraphPair.pair_key == pair_key,
+                        GraphPair.direction == direction,
+                    )
+                ).first()
+                pair = existing or GraphPair(
+                    graph_run_id=graph_run_id,
+                    evaluator_id=evaluator.id,
+                    target_stage_id=evaluator.target_stage,
+                    item_key=first.item.key,
+                    pair_key=pair_key,
+                    a_invocation_id=first.invocation_id,
+                    b_invocation_id=second.invocation_id,
+                    a_lineage_key=first.lineage_key,
+                    b_lineage_key=second.lineage_key,
+                    direction=direction,
+                    status=Status.pending,
+                )
+                session.add(pair)
+                session.flush()
+                created_or_existing.append(pair)
+    session.commit()
+    return session.exec(select(GraphPair).where(GraphPair.graph_run_id == graph_run_id, GraphPair.evaluator_id == evaluator.id)).all()
+
+
+async def _run_llm_judge_pair(graph_run_id: int, evaluator: EvaluatorSpec, pair_id: int, constants: dict[str, str], output_mode: str, session_factory, client: OpenRouterClient, semaphore: asyncio.Semaphore) -> None:
+    with session_factory() as session:
+        pair = session.get(GraphPair, pair_id)
+        if not pair or pair.status == Status.complete:
+            return
+        a_invocation = session.get(GraphInvocation, pair.a_invocation_id)
+        b_invocation = session.get(GraphInvocation, pair.b_invocation_id)
+        if not a_invocation or not b_invocation:
+            pair.status = Status.failed
+            session.add(pair)
+            session.commit()
+            return
+        if output_mode == "json" and (not a_invocation.output_json or not b_invocation.output_json):
+            pair.status = Status.failed
+            session.add(pair)
+            session.commit()
+            return
+        values = {
+            **constants,
+            "output_a": a_invocation.output_json if output_mode == "json" else a_invocation.output_raw or "",
+            "output_b": b_invocation.output_json if output_mode == "json" else b_invocation.output_raw or "",
+            "model_a": pair.a_lineage_key,
+            "model_b": pair.b_lineage_key,
+            "lineage_a": pair.a_lineage_key,
+            "lineage_b": pair.b_lineage_key,
+        }
+        template = _prompt_text(evaluator.prompt_path, evaluator.prompt_inline)
+        rendered = render_template(template, values)
+        existing_judgement = session.exec(select(GraphJudgement).where(GraphJudgement.pair_id == pair_id, GraphJudgement.evaluator_type == "llm_pairwise")).first()
+        if existing_judgement and existing_judgement.winner:
+            pair.status = Status.complete
+            session.add(pair)
+            session.commit()
+            return
+        invocation = GraphInvocation(graph_run_id=graph_run_id, kind="llm_judge", stage_id=evaluator.target_stage, evaluator_id=evaluator.id, item_key=pair.item_key, lineage_key=pair.pair_key, stage_index=10_000, model_id=evaluator.model, rendered_prompt=rendered, status=Status.running, started_at=utc_now())
+        session.add(invocation)
+        session.commit()
+        invocation_id = invocation.id
+    try:
+        async with semaphore:
+            started = time.perf_counter()
+            response = await client.chat(model=evaluator.model, temperature=evaluator.params.temperature, reasoning_effort=evaluator.params.reasoning_effort, retries=evaluator.params.retry_count, messages=[{"role": "user", "content": rendered}])
+            duration = max(time.perf_counter() - started, 0.001)
+        parsed = parse_json_object(response.text)
+        winner = str(parsed.get(evaluator.output.winner_key, "TIE")).upper()
+        if winner not in {"A", "B", "TIE"}:
+            winner = "TIE"
+        reasoning = str(parsed.get(evaluator.output.reasoning_key, "")).strip()
+        with session_factory() as session:
+            invocation = session.get(GraphInvocation, invocation_id)
+            invocation.status = Status.complete
+            invocation.output_raw = response.text
+            invocation.output_json = maybe_repair_json(response.text)
+            invocation.prompt_tokens = response.prompt_tokens
+            invocation.completion_tokens = response.completion_tokens
+            invocation.duration_seconds = duration
+            invocation.output_tokens_per_second = (response.completion_tokens or 0) / duration if response.completion_tokens else None
+            invocation.cost = response.cost
+            invocation.completed_at = utc_now()
+            session.add(invocation)
+            judgement = GraphJudgement(pair_id=pair_id, evaluator_type="llm_pairwise", judge_invocation_id=invocation_id, winner=winner, reasoning=reasoning)
+            pair = session.get(GraphPair, pair_id)
+            pair.status = Status.complete
+            session.add(pair)
+            session.add(judgement)
+            session.commit()
+    except Exception as exc:  # noqa: BLE001
+        with session_factory() as session:
+            invocation = session.get(GraphInvocation, invocation_id)
+            invocation.status = Status.failed
+            invocation.error = str(exc)
+            invocation.error_category = _error_category(exc)
+            invocation.completed_at = utc_now()
+            session.add(invocation)
+            session.commit()
+        print(f"[graph run {graph_run_id}] judge failed: {traceback.format_exc()}", flush=True)
+
+
+def _run_spec(session, graph_run_id: int) -> GraphSpec:
+    run = _require_run(session, graph_run_id)
+    return parse_spec(run.spec_snapshot_json)
+
+
+def _require_run(session, graph_run_id: int) -> GraphRun:
+    run = session.get(GraphRun, graph_run_id)
+    if not run:
+        raise ValueError(f"Graph run {graph_run_id} does not exist")
+    return run
+
+
+def _requeue_unfinished_invocations(session, graph_run_id: int) -> None:
+    """Reset unfinished invocations so a resumed run can make forward progress."""
+
+    rows = session.exec(
+        select(GraphInvocation).where(
+            GraphInvocation.graph_run_id == graph_run_id,
+            GraphInvocation.status.in_([Status.failed, Status.running]),
+        )
+    ).all()
+    for invocation in rows:
+        invocation.status = Status.pending
+        invocation.error = None
+        invocation.error_category = None
+        invocation.output_raw = None
+        invocation.output_json = None
+        invocation.started_at = None
+        invocation.completed_at = None
+        invocation.prompt_tokens = None
+        invocation.completion_tokens = None
+        invocation.duration_seconds = None
+        invocation.output_tokens_per_second = None
+        invocation.cost = None
+        session.add(invocation)
 
 
 def _sync_graph_status(session, run: GraphRun) -> None:
     graph = session.get(ExperimentGraph, run.graph_id)
     if graph and run.status.value in {status.value for status in GraphStatus}:
         graph.status = GraphStatus(run.status.value)
+        graph.last_run_id = run.id
+        graph.updated_at = utc_now()
         session.add(graph)
 
 
-def graph_run_leaderboard(session, graph_run_id: int, nodes: list[GraphNode]) -> list[dict]:
-    """Compute the aggregate ELO leaderboard from graph-native judge invocations."""
-
-    return graph_run_leaderboards(session, graph_run_id, nodes, view_mode="aggregate")[0]["rows"]
-
-
-def graph_run_leaderboards(session, graph_run_id: int, nodes: list[GraphNode], *, view_mode: str = "aggregate") -> list[dict]:
-    """Compute aggregate and judge-prompt-scoped leaderboards."""
-
-    model_lookup = {node.id: node for node in nodes}
-    generator_nodes = [n for n in nodes if n.kind == "model" and config(n).get("role") == "generator"]
-    judge_nodes = [n for n in nodes if n.kind == "model" and config(n).get("role") == "judge"]
-    generator_ids = {n.id for n in generator_nodes}
-    run = session.get(GraphRun, graph_run_id)
-    edges = graph_edges(session, run.graph_id) if run else []
-    prompt_stages = sorted([node for node in nodes if node.kind == "prompt"], key=lambda node: (node.x, node.y, node.id or 0))
-    target_depths = _judge_target_depths([node for node in nodes if node.kind == "judge"], prompt_stages, generator_nodes, edges)
-
-    invocations = session.exec(
-        select(GraphInvocation).where(GraphInvocation.graph_run_id == graph_run_id)
-    ).all()
-
-    token_totals: dict[str, list[int]] = {str(n.id): [] for n in generator_nodes}
-    for inv in invocations:
-        model = model_lookup.get(inv.model_node_id)
-        if model and model.id in generator_ids and inv.status == Status.complete:
-            total = (inv.prompt_tokens or 0) + (inv.completion_tokens or 0)
-            token_totals[str(model.id)].append(total)
-
-    judge_invs = [
-        inv for inv in invocations
-        if inv.status == Status.complete and inv.output_json
-        and model_lookup.get(inv.node_id)
-        and model_lookup[inv.node_id].kind == "judge"
-    ]
-    groups = [("Overall", None, judge_invs)]
-    for judge_prompt in [node for node in nodes if node.kind == "judge"]:
-        scoped = [inv for inv in judge_invs if inv.node_id == judge_prompt.id]
-        if scoped:
-            groups.append((judge_prompt.title, judge_prompt.id, scoped))
-    return [
-        {
-            "title": title,
-            "judge_prompt_node_id": judge_prompt_id,
-            "view_mode": view_mode,
-            "rows": _leaderboard_rows_for_invocations(scoped, model_lookup, judge_nodes, token_totals, view_mode=view_mode, target_depth=target_depths.get(judge_prompt_id) if judge_prompt_id else None),
-        }
-        for title, judge_prompt_id, scoped in groups
-    ]
+def _prompt_text(path: str | None, inline: str | None) -> str:
+    if inline:
+        return inline
+    if path:
+        return Path(path).read_text(encoding="utf-8")
+    return ""
 
 
-def _leaderboard_rows_for_invocations(
-    judge_invs: list[GraphInvocation],
-    model_lookup: dict[int, GraphNode],
-    judge_nodes: list[GraphNode],
-    token_totals: dict[str, list[int]],
-    *,
-    view_mode: str,
-    target_depth: int | None,
-) -> list[dict]:
-    entities: set[str] = set()
-    for inv in judge_invs:
-        parsed = _parse_judge_pair(inv.item_key)
-        if parsed:
-            display_a, display_b = _display_entities(parsed, view_mode, target_depth)
-            if display_a != display_b:
-                entities.update((display_a, display_b))
-    wins: dict[str, int] = {entity: 0 for entity in entities}
-    losses: dict[str, int] = {entity: 0 for entity in entities}
-    ties: dict[str, int] = {entity: 0 for entity in entities}
-    ratings: dict[str, float] = {entity: 1500.0 for entity in entities}
-    judge_tallies: dict[int, dict[str, int]] = {n.id: {} for n in judge_nodes}
-    for inv in judge_invs:
-        judge_prompt = model_lookup[inv.node_id]
-        winner_key = config(judge_prompt).get("winner_key") or "winner"
-        parsed = _parse_judge_pair(inv.item_key)
-        if not parsed:
-            continue
-        entity_a, entity_b = _display_entities(parsed, view_mode, target_depth)
-        if entity_a == entity_b:
-            continue
-        try:
-            result = json.loads(inv.output_json)
-            winner = str(result.get(winner_key, "TIE")).upper()
-        except (json.JSONDecodeError, AttributeError):
-            continue
-        judge_model = model_lookup.get(inv.model_node_id)
-        if winner == "A":
-            wins[entity_a] += 1
-            losses[entity_b] += 1
-            ratings[entity_a], ratings[entity_b] = update_elo(ratings[entity_a], ratings[entity_b], "A")
-            if judge_model:
-                judge_tallies[judge_model.id][entity_a] = judge_tallies[judge_model.id].get(entity_a, 0) + 1
-        elif winner == "B":
-            wins[entity_b] += 1
-            losses[entity_a] += 1
-            ratings[entity_a], ratings[entity_b] = update_elo(ratings[entity_a], ratings[entity_b], "B")
-            if judge_model:
-                judge_tallies[judge_model.id][entity_b] = judge_tallies[judge_model.id].get(entity_b, 0) + 1
-        else:
-            ties[entity_a] += 1
-            ties[entity_b] += 1
-            ratings[entity_a], ratings[entity_b] = update_elo(ratings[entity_a], ratings[entity_b], "TIE")
-
-    favorites: dict[str, list[GraphNode]] = {entity: [] for entity in entities}
-    for judge_id, tallies in judge_tallies.items():
-        if not tallies:
-            continue
-        favorite_id = max(tallies.items(), key=lambda x: x[1])[0]
-        judge_model = model_lookup.get(judge_id)
-        if judge_model:
-            favorites[favorite_id].append(judge_model)
-
-    rows = []
-    for entity in entities:
-        node = _entity_last_node(entity, model_lookup)
-        totals = token_totals.get(entity, []) or token_totals.get(str(node.id) if node else "", [])
-        rows.append(
-            {
-                "entity_key": entity,
-                "label": _entity_label(entity, model_lookup),
-                "node": node,
-                "rating": ratings[entity],
-                "wins": wins[entity],
-                "losses": losses[entity],
-                "ties": ties[entity],
-                "avg_tokens": f"{sum(totals) // len(totals):,}" if totals else "-",
-                "favorites": favorites.get(entity, []),
-            }
-        )
-
-    rows.sort(key=lambda r: r["rating"], reverse=True)
-    return rows
+def _prompt_snapshots(spec: GraphSpec) -> dict[str, dict[str, str]]:
+    paths = [candidate.prompt_path for stage in spec.stages for candidate in stage.candidates if candidate.prompt_path]
+    paths += [evaluator.prompt_path for evaluator in spec.evaluators if evaluator.type == "llm_pairwise" and evaluator.prompt_path]
+    snapshots = {}
+    for path in sorted(set(paths)):
+        content = Path(path).read_text(encoding="utf-8")
+        snapshots[path] = {"content": content, "hash": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+    return snapshots
 
 
-def _parse_judge_pair(item_key: str) -> tuple[str, str] | None:
+def _dataset_hash(items: list[DatasetItem]) -> str:
+    payload = json.dumps([{"item_key": item.key, "values": item.values} for item in items], sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _sample_pairs(pairs: list[tuple[OutputBranch, OutputBranch]], sample_pct: float) -> list[tuple[OutputBranch, OutputBranch]]:
+    if sample_pct >= 100:
+        return pairs
+    if not pairs:
+        return []
+    count = max(1, int(len(pairs) * max(1.0, min(100.0, sample_pct)) / 100))
+    return pairs[:count]
+
+
+def _terminal_candidate(lineage_key: str) -> str:
+    return lineage_key.split("->")[-1] if lineage_key else ""
+
+
+def _optional_int(value: Any) -> int | None:
     try:
-        _item, pair = item_key.rsplit(":", 1)
-        entity_a, entity_b = pair.split("-vs-", 1)
-        return entity_a, entity_b
-    except ValueError:
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    except (TypeError, ValueError):
         return None
 
 
-def _display_entities(pair: tuple[str, str], view_mode: str, target_depth: int | None) -> tuple[str, str]:
-    pair = (_truncate_entity(pair[0], target_depth), _truncate_entity(pair[1], target_depth))
-    if view_mode in {"chain", "overall"}:
-        return pair
-    return _entity_final_model(pair[0]), _entity_final_model(pair[1])
+def _unresolved_inputs(rendered: str) -> list[str]:
+    import re
+
+    return sorted(set(re.findall(r"{{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*}}", rendered)))
 
 
-def _truncate_entity(entity: str, target_depth: int | None) -> str:
-    if not target_depth:
-        return entity
-    return ">".join(entity.split(">")[:target_depth])
-
-
-def _entity_final_model(entity: str) -> str:
-    return entity.split(">")[-1]
-
-
-def _judge_target_depths(
-    judge_prompts: list[GraphNode],
-    prompt_stages: list[GraphNode],
-    generator_models: list[GraphNode],
-    edges: list[GraphEdge],
-) -> dict[int, int]:
-    """Map judge prompt ids to the prompt-stage depth they visually judge."""
-
-    prompt_by_id = {prompt.id: prompt for prompt in prompt_stages}
-    generator_model_ids = {node.id for node in generator_models}
-    depths = {}
-    for judge_prompt in judge_prompts:
-        target = None
-        incoming = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in prompt_by_id]
-        if incoming:
-            target = prompt_by_id[incoming[-1]]
-        else:
-            incoming_models = [edge.from_node_id for edge in edges if edge.to_node_id == judge_prompt.id and edge.from_node_id in generator_model_ids]
-            prompt_ids = [edge.from_node_id for edge in edges if edge.to_node_id in incoming_models and edge.from_node_id in prompt_by_id]
-            if prompt_ids:
-                target = prompt_by_id[prompt_ids[-1]]
-        if target and judge_prompt.id:
-            depths[judge_prompt.id] = prompt_stages.index(target) + 1
-    return depths
-
-
-def _entity_last_node(entity: str, model_lookup: dict[int, GraphNode]) -> GraphNode | None:
-    try:
-        return model_lookup.get(int(entity.split(">")[-1]))
-    except ValueError:
-        return None
-
-
-def _entity_label(entity: str, model_lookup: dict[int, GraphNode]) -> str:
-    labels = []
-    for part in entity.split(">"):
-        try:
-            node = model_lookup.get(int(part))
-        except ValueError:
-            node = None
-        labels.append(node.title if node else part)
-    return " -> ".join(labels)
+def _error_category(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "api_key" in message or "api key" in message:
+        return "missing_api_key"
+    if "404" in message or "not found" in message:
+        return "model_not_found"
+    if "timeout" in message:
+        return "timeout"
+    if "rate" in message or "429" in message:
+        return "rate_limit"
+    return "model_call_failed"

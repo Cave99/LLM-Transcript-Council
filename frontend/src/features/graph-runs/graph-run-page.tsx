@@ -1,23 +1,25 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import ReactFlow, { Background, Controls, type Edge, type Node, Position, Handle } from "reactflow";
-import { Database, FileText, Gavel, MessageSquare, RotateCcw, Star, Settings, Square, StepForward } from "lucide-react";
+import ReactFlow, { Background, Controls, Handle, Position, type Edge, type Node } from "reactflow";
+import { ArrowLeft, Bot, Database, Gavel, GitBranch, RotateCcw, Square, StepForward } from "lucide-react";
 import { client } from "../../api/client";
 import { queryClient } from "../../api/queries";
-import type { GraphInvocationDto, GraphNodeDto, GraphProgress, GraphRunDetail, LeaderboardView } from "../../api/types";
+import type { GraphInvocationDto, GraphPairDto, GraphRunDetail, SemanticNodeDto } from "../../api/types";
 import { Button } from "../../components/ui/button";
 import { Progress } from "../../components/ui/progress";
 import { Table } from "../../components/ui/table";
 import { StatusPill } from "../../components/status-pill";
 import { DataTable } from "../../components/data-table";
+import { Textarea } from "../../components/ui/textarea";
+import { Input } from "../../components/ui/input";
 
-const runNodeTypes = { runPreview: RunPreviewNode };
+const runNodeTypes = { semantic: RunNode };
 
 export function GraphRunPage() {
   const runId = Number(useParams().graphRunId);
   const { data, isLoading, error } = useQuery({
-    queryKey: ["graph-run", runId, "base"],
+    queryKey: ["graph-run", runId],
     queryFn: () => client.graphRun(runId, "aggregate"),
     enabled: Number.isFinite(runId),
     refetchInterval: (query) => query.state.data?.run.status === "running" ? 5000 : false
@@ -42,84 +44,37 @@ export function GraphRunPage() {
           <Link className="text-sm text-accent hover:text-accent-hover" to={`/graphs/${data.graph.id}`}>{data.graph.name}</Link>
         </div>
         <div className="flex gap-2">
+          <Link
+            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md border border-line bg-surface px-3 py-1.5 text-sm font-semibold transition hover:border-line-strong hover:bg-surface-muted focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-accent/20"
+            to={`/graphs/${data.graph.id}`}
+          >
+            <ArrowLeft size={15} /> Back to Graph
+          </Link>
           {data.run.status === "running" ? <Button variant="subtle" onClick={() => stop.mutate()}><Square size={15} /> Stop</Button> : null}
           {["paused", "pending", "failed"].includes(data.run.status) ? <Button onClick={() => cont.mutate()}><StepForward size={15} /> Continue</Button> : null}
           {data.progress.failed ? <Button variant="subtle" onClick={() => retry.mutate()}><RotateCcw size={15} /> Retry Failures</Button> : null}
         </div>
       </section>
 
-      <section className="panel grid gap-3 p-4">
-        <div className="flex items-center justify-between text-sm">
-          <strong>Progress</strong>
-          <span className="text-muted">{data.progress.complete}/{data.progress.total} complete · {data.progress.failed} failed</span>
-        </div>
-        <Progress value={percent} />
-        <div className="flex flex-wrap gap-2 text-xs text-muted">
-          <span>Pending {data.progress.pending}</span>
-          <span>Running {data.progress.running}</span>
-          <span>Complete {data.progress.complete}</span>
-          <span>Failed {data.progress.failed}</span>
-        </div>
-        {data.diagnostics.map((diagnostic) => <p key={diagnostic.message} className="text-sm text-muted">{diagnostic.message}</p>)}
-      </section>
-
-      <RunGraphPreview nodes={data.nodes} edges={data.edges} nodeProgress={data.node_progress} />
-
-      <LeaderboardsSection runId={runId} initialData={data} />
-
-      {data.analyses.length ? (
-        <section className="panel grid gap-3 p-4">
-          <h2 className="text-sm font-bold">Judge Summaries</h2>
-          {data.analyses.map((analysis) => (
-            <article key={analysis.id} className="rounded-md border border-line bg-surface-muted p-3">
-              <h3 className="text-sm font-bold">{analysis.top_entity_label}</h3>
-              <pre className="mt-2 font-sans text-sm leading-6 text-ink-soft">{analysis.summary}</pre>
-            </article>
-          ))}
-        </section>
-      ) : null}
-
-      <OutputBrowser invocations={data.invocations} nodes={data.nodes} />
+      <RunGraphPreview data={data} />
+      <LeaderboardsSection data={data} />
+      <HumanEvalSection runId={runId} pairs={data.human_evals} onChanged={invalidate} />
+      <OutputBrowser invocations={data.invocations} />
     </div>
   );
 }
 
-function RunGraphPreview({ nodes, edges, nodeProgress }: { nodes: GraphNodeDto[]; edges: { id: number; from_node_id: number; from_socket: string; to_node_id: number; to_socket: string }[]; nodeProgress: Record<number, GraphProgress> }) {
-  const flowNodes: Node[] = useMemo(() => nodes.map((node) => ({
-    id: String(node.id),
-    type: "runPreview",
-    position: { x: node.x, y: node.y },
-    data: { node, progress: nodeProgress[node.id] },
-    draggable: false,
-    selectable: false,
-    style: { width: 260 }
-  })), [nodeProgress, nodes]);
-
-  const flowEdges: Edge[] = useMemo(() => edges.map((edge) => ({
-    id: String(edge.id),
-    source: String(edge.from_node_id),
-    target: String(edge.to_node_id),
-    sourceHandle: edge.from_socket,
-    targetHandle: edge.to_socket,
-    animated: Boolean(nodeProgress[edge.from_node_id]?.running || nodeProgress[edge.to_node_id]?.running)
-  })), [edges, nodeProgress]);
-
+function RunGraphPreview({ data }: { data: GraphRunDetail }) {
+  const nodes: Node[] = useMemo(() => data.nodes.map((node) => ({ id: node.id, type: "semantic", position: { x: node.x, y: node.y }, data: { node }, draggable: false })), [data.nodes]);
+  const edges: Edge[] = useMemo(() => data.edges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target })), [data.edges]);
   return (
     <section className="panel overflow-hidden">
       <div className="flex items-center justify-between border-b border-line bg-surface-muted px-4 py-3">
-        <h2 className="text-sm font-bold">Graph Preview</h2>
-        <span className="text-xs text-muted">Per-node work updates with the run</span>
+        <h2 className="text-sm font-bold">Run Graph</h2>
+        <span className="text-xs text-muted">Semantic spec preview</span>
       </div>
-      <div className="h-[420px]">
-        <ReactFlow
-          nodes={flowNodes}
-          edges={flowEdges}
-          nodeTypes={runNodeTypes}
-          nodesDraggable={false}
-          nodesConnectable={false}
-          elementsSelectable={false}
-          fitView
-        >
+      <div className="h-[360px]">
+        <ReactFlow nodes={nodes} edges={edges} nodeTypes={runNodeTypes} nodesDraggable={false} nodesConnectable={false} elementsSelectable={false} fitView>
           <Background />
           <Controls showInteractive={false} />
         </ReactFlow>
@@ -128,240 +83,126 @@ function RunGraphPreview({ nodes, edges, nodeProgress }: { nodes: GraphNodeDto[]
   );
 }
 
-function LeaderboardsSection({ runId, initialData }: { runId: number; initialData: GraphRunDetail }) {
-  const [view, setView] = useState<LeaderboardView>("aggregate");
-  const { data } = useQuery({
-    queryKey: ["graph-run-leaderboards", runId, view],
-    queryFn: () => client.graphRun(runId, view),
-    enabled: Number.isFinite(runId),
-    placeholderData: (previous) => previous ?? (view === "aggregate" ? initialData : undefined),
-    refetchInterval: (query) => query.state.data?.run.status === "running" ? 5000 : false
-  });
-  const summary = useMutation({
-    mutationFn: ({ judge, entity }: { judge?: number | null; entity?: string }) => client.judgeSummary(runId, view, judge, entity || ""),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["graph-run-leaderboards", runId] });
-      queryClient.invalidateQueries({ queryKey: ["graph-run", runId, "base"] });
-    }
-  });
-  const leaderboards = data?.leaderboards ?? [];
-
+function RunNode({ data }: { data: { node: SemanticNodeDto } }) {
+  const Icon = data.node.kind === "dataset" ? Database : data.node.kind === "evaluator" ? Gavel : data.node.kind === "candidate" ? Bot : GitBranch;
   return (
-    <section className="panel grid gap-4 p-4">
-      <div className="flex items-center justify-between gap-3">
-        <h2 className="text-sm font-bold">Leaderboards</h2>
-        <div className="inline-grid grid-cols-3 overflow-hidden rounded-lg border border-line bg-surface-muted p-1">
-          {(["aggregate", "overall", "chain"] as LeaderboardView[]).map((option) => (
-            <button
-              key={option}
-              type="button"
-              className={[
-                "min-h-9 whitespace-nowrap rounded-md px-3 text-sm font-bold transition",
-                view === option ? "bg-accent text-white shadow-sm" : "text-ink-soft hover:bg-surface hover:text-ink"
-              ].join(" ")}
-              onClick={() => setView(option)}
-            >
-              {option === "aggregate" ? "For step" : option === "overall" ? "Across steps" : "Chain"}
-            </button>
-          ))}
-        </div>
+    <div className="relative min-w-[220px] rounded-lg border border-line bg-surface shadow-sm">
+      <Handle type="target" position={Position.Left} className="!left-[-5px]" />
+      <div className="flex items-center gap-2 border-b border-line px-3 py-2">
+        <Icon size={15} className="text-accent" />
+        <strong className="truncate text-sm">{data.node.title}</strong>
       </div>
-      {leaderboards.map((group) => (
-        <div key={`${group.title}-${group.judge_prompt_node_id ?? "overall"}`} className="grid gap-3">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold">{group.title}</h3>
-            <Button type="button" variant="subtle" onClick={() => summary.mutate({ judge: group.judge_prompt_node_id })}>Summarize</Button>
-          </div>
-          <DataTable>
-            <Table>
-              <thead className="border-b border-line bg-surface-muted text-xs text-muted">
-                <tr><th className="p-2">Rank</th><th className="p-2">Model</th><th className="p-2">ELO</th><th className="p-2">W-L-T</th><th className="p-2">Avg tokens</th></tr>
-              </thead>
-              <tbody>
-                {group.rows.map((row, index) => (
-                  <tr key={row.entity_key} className="border-b border-line last:border-0">
-                    <td className="p-2 text-muted">{index + 1}</td>
-                    <td className="p-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-semibold">{row.label}</span>
-                        {row.favorites.map((favorite) => (
-                          <span
-                            key={favorite.id}
-                            className="inline-flex items-center gap-1 rounded-full border border-accent/25 bg-accent-soft px-2 py-0.5 text-[11px] font-bold text-accent"
-                            title={`${favorite.title} favored this entry most`}
-                          >
-                            <Star size={11} />
-                            {favorite.title}
-                          </span>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="p-2">{row.rating.toFixed(1)}</td>
-                    <td className="p-2">{row.wins}-{row.losses}-{row.ties}</td>
-                    <td className="p-2">{row.avg_tokens}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </Table>
-          </DataTable>
-        </div>
-      ))}
-    </section>
-  );
-}
-
-function RunPreviewNode({ data }: { data: { node: GraphNodeDto; progress?: GraphProgress } }) {
-  const node = data.node;
-  const progress = data.progress || { total: 0, pending: 0, running: 0, complete: 0, failed: 0 };
-  const Icon = previewIcons[node.kind as keyof typeof previewIcons] || FileText;
-  const status = progress.failed ? "failed" : progress.running ? "running" : progress.total && progress.complete === progress.total ? "complete" : "pending";
-
-  return (
-    <div className="relative rounded-lg border border-line bg-surface shadow-sm">
-      <div className="flex items-start justify-between gap-3 border-b border-line px-3 py-2">
-        <div className="flex min-w-0 items-center gap-2">
-          <Icon size={15} className="text-accent" />
-          <div className="min-w-0">
-            <strong className="block truncate text-sm">{node.title}</strong>
-            <span className="block text-[10px] font-bold uppercase tracking-wide text-muted">{node.kind}</span>
-          </div>
-        </div>
-        <span className={[
-          "rounded-full border px-2 py-0.5 text-[11px] font-bold",
-          status === "complete" ? "border-success/30 bg-success-soft text-success" : "",
-          status === "running" ? "border-warning/30 bg-warning-soft text-warning" : "",
-          status === "failed" ? "border-danger/30 bg-danger-soft text-danger" : "",
-          status === "pending" ? "border-line bg-surface-muted text-muted" : ""
-        ].join(" ")}>
-          {progress.complete}/{progress.total}
-        </span>
-      </div>
-      <div className="grid grid-cols-3 gap-1 p-3 text-center text-[11px] text-muted">
-        <span>Pending {progress.pending}</span>
-        <span>Running {progress.running}</span>
-        <span>Failed {progress.failed}</span>
-      </div>
-      {node.input_sockets.map((socket, index) => (
-        <Handle key={`in-${socket}`} type="target" id={socket} position={Position.Left} className="!left-[-5px]" style={{ top: 48 + index * 16 }} />
-      ))}
-      {node.output_sockets.map((socket, index) => (
-        <Handle key={`out-${socket}`} type="source" id={socket} position={Position.Right} className="!right-[-5px]" style={{ top: 48 + index * 16 }} />
-      ))}
+      <div className="p-3 text-xs font-mono text-muted">{data.node.id}</div>
+      <Handle type="source" position={Position.Right} className="!right-[-5px]" />
     </div>
   );
 }
 
-const previewIcons = {
-  dataset: Database,
-  prompt: MessageSquare,
-  constant: FileText,
-  model: Settings,
-  judge: Gavel
-};
-
-function OutputBrowser({ invocations, nodes }: { invocations: GraphInvocationDto[]; nodes: GraphNodeDto[] }) {
-  const [openId, setOpenId] = useState<number | null>(null);
-  const [openModels, setOpenModels] = useState<Set<string>>(new Set());
-  const groups = useMemo(() => {
-    const nodeById = new Map(nodes.map((node) => [node.id, node]));
-    const map = new Map<string, Map<string, Map<string, GraphInvocationDto[]>>>();
-    invocations.forEach((invocation) => {
-      const node = nodeById.get(invocation.node_id);
-      const role = node?.kind === "judge" ? "Judge outputs" : "Generator outputs";
-      const promptTitle = invocation.node_title || "Unknown prompt";
-      const modelTitle = invocation.model_title || "Unknown model";
-      if (!map.has(role)) map.set(role, new Map());
-      const promptMap = map.get(role)!;
-      if (!promptMap.has(promptTitle)) promptMap.set(promptTitle, new Map());
-      const modelMap = promptMap.get(promptTitle)!;
-      modelMap.set(modelTitle, [...(modelMap.get(modelTitle) || []), invocation]);
-    });
-    return [...map.entries()];
-  }, [invocations, nodes]);
-
+function LeaderboardsSection({ data }: { data: GraphRunDetail }) {
   return (
-    <section className="grid gap-4">
-      <h2 className="text-sm font-bold">Model Outputs</h2>
-      {groups.map(([role, promptGroups]) => (
-        <div key={role} className="panel grid gap-4 p-4">
-          <h3 className="text-sm font-bold">{role}</h3>
-          {[...promptGroups.entries()].map(([promptTitle, modelGroups]) => (
-            <div key={promptTitle} className="grid gap-3 rounded-lg border border-line bg-surface-muted/50 p-3">
-              <h4 className="text-sm font-bold">{promptTitle}</h4>
-              {[...modelGroups.entries()].map(([modelTitle, rows]) => (
-                <div key={modelTitle} className="grid gap-2 rounded-md border border-line bg-surface p-3">
-                  <ModelGroupHeader
-                    modelTitle={modelTitle}
-                    rows={rows}
-                    open={openModels.has(modelGroupKey(role, promptTitle, modelTitle))}
-                    onToggle={() => {
-                      const key = modelGroupKey(role, promptTitle, modelTitle);
-                      setOpenModels((current) => {
-                        const next = new Set(current);
-                        if (next.has(key)) next.delete(key);
-                        else next.add(key);
-                        return next;
-                      });
-                    }}
-                  />
-                  {openModels.has(modelGroupKey(role, promptTitle, modelTitle)) ? (
-                    <div className="grid gap-2">
-                      {rows.map((invocation) => (
-                        <InvocationCard key={invocation.id} invocation={invocation} open={openId === invocation.id} onToggle={() => setOpenId(openId === invocation.id ? null : invocation.id)} />
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
+    <section className="panel grid gap-4 p-4">
+      <h2 className="text-sm font-bold">Leaderboard</h2>
+      {data.leaderboards.map((group) => (
+        <DataTable key={group.title}>
+          <Table>
+            <thead className="border-b border-line bg-surface-muted text-xs text-muted">
+              <tr><th className="p-2">Rank</th><th className="p-2">Candidate</th><th className="p-2">ELO</th><th className="p-2">W-L-T</th></tr>
+            </thead>
+            <tbody>
+              {group.rows.map((row, index) => (
+                <tr key={row.entity_key} className="border-b border-line last:border-0">
+                  <td className="p-2 text-muted">{index + 1}</td>
+                  <td className="p-2 font-semibold">{row.label}</td>
+                  <td className="p-2">{row.rating.toFixed(1)}</td>
+                  <td className="p-2">{row.wins}-{row.losses}-{row.ties}</td>
+                </tr>
               ))}
-            </div>
-          ))}
-        </div>
+            </tbody>
+          </Table>
+        </DataTable>
       ))}
     </section>
   );
 }
 
-function ModelGroupHeader({ modelTitle, rows, open, onToggle }: { modelTitle: string; rows: GraphInvocationDto[]; open: boolean; onToggle: () => void }) {
-  const complete = rows.filter((row) => row.status === "complete").length;
-  const failed = rows.filter((row) => row.status === "failed").length;
-  const running = rows.filter((row) => row.status === "running").length;
+function HumanEvalSection({ runId, pairs, onChanged }: { runId: number; pairs: GraphPairDto[]; onChanged: () => void }) {
+  const humanPairs = pairs.filter((pair) => !pair.winner);
+  const submit = useMutation({
+    mutationFn: ({ pair, winner, reasoning, reviewer }: { pair: GraphPairDto; winner: "A" | "B" | "TIE"; reasoning: string; reviewer: string }) => client.submitHumanEval(runId, pair.id, winner, reasoning, reviewer),
+    onSuccess: onChanged,
+  });
+  if (!pairs.length) return null;
   return (
-    <button type="button" className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1 text-left hover:bg-surface-muted" onClick={onToggle}>
-      <span className="flex min-w-0 items-center gap-2">
-        <span className="w-4 text-center text-muted">{open ? "−" : "+"}</span>
-        <span className="truncate text-sm font-semibold">{modelTitle}</span>
-      </span>
-      <span className="flex shrink-0 items-center gap-3 text-xs text-muted">
-        <span>{rows.length} call{rows.length === 1 ? "" : "s"}</span>
-        {running ? <span>{running} running</span> : null}
-        {failed ? <span className="text-danger">{failed} failed</span> : null}
-        <span>{complete} complete</span>
-      </span>
-    </button>
+    <section className="panel grid gap-4 p-4">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-bold">Human Review</h2>
+        <span className="text-xs text-muted">{humanPairs.length} pending · {pairs.length - humanPairs.length} complete</span>
+      </div>
+      {humanPairs.slice(0, 20).map((pair) => <HumanPair key={pair.id} pair={pair} onSubmit={(winner, reasoning, reviewer) => submit.mutate({ pair, winner, reasoning, reviewer })} />)}
+    </section>
   );
 }
 
-function modelGroupKey(role: string, promptTitle: string, modelTitle: string) {
-  return `${role}::${promptTitle}::${modelTitle}`;
+function HumanPair({ pair, onSubmit }: { pair: GraphPairDto; onSubmit: (winner: "A" | "B" | "TIE", reasoning: string, reviewer: string) => void }) {
+  const [reasoning, setReasoning] = useState("");
+  const [reviewer, setReviewer] = useState("");
+  return (
+    <article className="grid gap-3 rounded-md border border-line bg-surface-muted p-3">
+      <div className="flex justify-between gap-3 text-sm">
+        <strong>{pair.item_key}</strong>
+        <span className="text-muted">{pair.a_lineage_key} vs {pair.b_lineage_key}</span>
+      </div>
+      <div className="grid grid-cols-2 gap-3">
+        <pre className="max-h-64 overflow-auto rounded bg-surface p-3 text-xs">{pair.output_a || "No output"}</pre>
+        <pre className="max-h-64 overflow-auto rounded bg-surface p-3 text-xs">{pair.output_b || "No output"}</pre>
+      </div>
+      <Input placeholder="Reviewer" value={reviewer} onChange={(event) => setReviewer(event.target.value)} />
+      <Textarea placeholder="Reasoning" value={reasoning} onChange={(event) => setReasoning(event.target.value)} />
+      <div className="flex gap-2">
+        <Button type="button" onClick={() => onSubmit("A", reasoning, reviewer)}>A</Button>
+        <Button type="button" onClick={() => onSubmit("B", reasoning, reviewer)}>B</Button>
+        <Button type="button" variant="subtle" onClick={() => onSubmit("TIE", reasoning, reviewer)}>Tie</Button>
+      </div>
+    </article>
+  );
 }
 
-function InvocationCard({ invocation, open, onToggle }: { invocation: GraphInvocationDto; open: boolean; onToggle: () => void }) {
+function OutputBrowser({ invocations }: { invocations: GraphInvocationDto[] }) {
+  const [openId, setOpenId] = useState<number | null>(null);
+  const groups = useMemo(() => {
+    const map = new Map<string, GraphInvocationDto[]>();
+    invocations.forEach((invocation) => {
+      const key = invocation.kind === "llm_judge" ? `Judge: ${invocation.evaluator_id}` : `Stage: ${invocation.stage_id} / ${invocation.candidate_id}`;
+      map.set(key, [...(map.get(key) || []), invocation]);
+    });
+    return [...map.entries()];
+  }, [invocations]);
   return (
-    <article className="rounded-md border border-line bg-surface p-3">
-      <button className="flex w-full items-center justify-between text-left" onClick={onToggle}>
-        <span className="font-semibold">{invocation.item_key}</span>
-        <StatusPill status={invocation.status} />
-      </button>
-      {open ? (
-        <div className="mt-3 grid gap-3 text-sm">
-          {invocation.error ? <p className="text-danger">{invocation.error}</p> : null}
-          <pre className="rounded-md bg-surface-muted p-3">{invocation.output_json || invocation.output_raw || "No output"}</pre>
-          <details>
-            <summary className="cursor-pointer text-muted">Rendered prompt</summary>
-            <pre className="mt-2 rounded-md bg-surface-muted p-3">{invocation.rendered_prompt}</pre>
-          </details>
+    <section className="grid gap-4">
+      <h2 className="text-sm font-bold">Model Calls</h2>
+      {groups.map(([title, rows]) => (
+        <div key={title} className="panel grid gap-3 p-4">
+          <h3 className="text-sm font-bold">{title}</h3>
+          {rows.map((invocation) => (
+            <article key={invocation.id} className="rounded-md border border-line bg-surface p-3">
+              <button className="flex w-full items-center justify-between text-left" onClick={() => setOpenId(openId === invocation.id ? null : invocation.id)}>
+                <span className="font-semibold">{invocation.item_key} · {invocation.lineage_key}</span>
+                <StatusPill status={invocation.status} />
+              </button>
+              {openId === invocation.id ? (
+                <div className="mt-3 grid gap-3 text-sm">
+                  {invocation.error ? <p className="text-danger">{invocation.error}</p> : null}
+                  <pre className="max-h-96 overflow-auto rounded-md bg-surface-muted p-3">{invocation.output_json || invocation.output_raw || "No output"}</pre>
+                  <details>
+                    <summary className="cursor-pointer text-muted">Rendered prompt</summary>
+                    <pre className="mt-2 max-h-96 overflow-auto rounded-md bg-surface-muted p-3">{invocation.rendered_prompt}</pre>
+                  </details>
+                </div>
+              ) : null}
+            </article>
+          ))}
         </div>
-      ) : null}
-    </article>
+      ))}
+    </section>
   );
 }

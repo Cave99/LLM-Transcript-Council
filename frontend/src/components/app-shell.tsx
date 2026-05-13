@@ -17,7 +17,7 @@ export function AppShell() {
           </NavLink>
         </nav>
       </header>
-      <main className="mx-auto w-[min(1160px,calc(100vw-40px))] py-8 pb-20">
+      <main className="mx-auto w-[min(1480px,calc(100vw-24px))] py-8 pb-20">
         <Outlet />
       </main>
     </>

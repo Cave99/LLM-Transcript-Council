@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend import schemas
-from backend.api import analysis, edges, graph_runs, graphs, nodes, projects
+from backend.api import analysis, graph_runs, graphs, projects
 from council.db import init_db
 
 load_dotenv()
@@ -25,8 +25,6 @@ app.add_middleware(
 
 app.include_router(projects.router, prefix="/api")
 app.include_router(graphs.router, prefix="/api")
-app.include_router(nodes.router, prefix="/api")
-app.include_router(edges.router, prefix="/api")
 app.include_router(graph_runs.router, prefix="/api")
 app.include_router(analysis.router, prefix="/api")
 

@@ -1,4 +1,4 @@
-"""Pydantic schemas for the graph-native API."""
+"""Pydantic schemas for the spec-backed graph API."""
 
 from __future__ import annotations
 
@@ -7,11 +7,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-
-NodeKind = Literal["dataset", "prompt", "constant", "model", "judge"]
 StatusValue = Literal["pending", "running", "complete", "failed", "paused"]
 GraphStatusValue = Literal["draft", "running", "complete", "failed", "paused"]
-LeaderboardView = Literal["aggregate", "overall", "chain"]
+LeaderboardView = Literal["aggregate"]
 
 
 class ApiErrorDetail(BaseModel):
@@ -55,6 +53,7 @@ class GraphSummary(BaseModel):
     name: str
     status: GraphStatusValue
     last_run_id: int | None
+    spec_hash: str
     created_at: datetime
     updated_at: datetime
 
@@ -74,57 +73,59 @@ class ProjectUpdate(BaseModel):
 class GraphCreate(BaseModel):
     project_id: int
     name: str
+    spec: dict[str, Any] | None = None
 
 
 class GraphUpdate(BaseModel):
-    name: str
+    name: str | None = None
+    spec: dict[str, Any] | None = None
+    layout: dict[str, Any] | None = None
 
 
-class GraphNodeDto(BaseModel):
-    id: int
-    graph_id: int
+class ValidationMessageDto(BaseModel):
+    code: str
+    path: str
+    message: str
+
+
+class ValidationResultDto(BaseModel):
+    valid: bool
+    errors: list[ValidationMessageDto] = Field(default_factory=list)
+    warnings: list[ValidationMessageDto] = Field(default_factory=list)
+
+
+class SemanticNodeDto(BaseModel):
+    id: str
     kind: str
     title: str
-    body: str
-    config: dict[str, Any]
     x: int
     y: int
-    width: int
-    height: int
-    input_sockets: list[str]
-    output_sockets: list[str]
-    created_at: datetime
-    updated_at: datetime
 
 
-class GraphEdgeDto(BaseModel):
-    id: int
-    graph_id: int
-    from_node_id: int
-    from_socket: str
-    to_node_id: int
-    to_socket: str
-    created_at: datetime
+class SemanticEdgeDto(BaseModel):
+    id: str
+    source: str
+    target: str
 
 
 class GraphPlanDto(BaseModel):
     transcript_count: int
-    prompt_stage_count: int
-    generator_model_count: int
-    judge_model_count: int
-    pair_count: int
-    sampled_matches_per_transcript: int
+    stage_count: int
+    candidate_count: int
+    evaluator_count: int
     generation_calls: int
-    match_count: int
+    pair_count: int
     judge_calls: int
-    swap_multiplier: int
+    human_review_count: int
     warnings: list[str]
 
 
 class GraphDetail(BaseModel):
     graph: GraphSummary
-    nodes: list[GraphNodeDto]
-    edges: list[GraphEdgeDto]
+    spec: dict[str, Any]
+    layout: dict[str, Any]
+    nodes: list[SemanticNodeDto]
+    edges: list[SemanticEdgeDto]
     plan: GraphPlanDto
     latest_run: GraphRunSummary | None = None
     graph_runs: list[GraphRunSummary] = Field(default_factory=list)
@@ -133,39 +134,6 @@ class GraphDetail(BaseModel):
 class LaunchGraphRunRequest(BaseModel):
     run_mode: Literal["test", "full"] = "full"
     max_concurrency: int = Field(default=5, ge=1, le=50)
-
-
-class CreateNodeRequest(BaseModel):
-    kind: NodeKind
-    title: str | None = None
-    x: int | None = None
-    y: int | None = None
-
-
-class UpdateNodeRequest(BaseModel):
-    title: str
-    body: str = ""
-    config: dict[str, Any] = Field(default_factory=dict)
-
-
-class UpdateNodePositionRequest(BaseModel):
-    x: int
-    y: int
-    width: int | None = None
-    height: int | None = None
-
-
-class CreateEdgeRequest(BaseModel):
-    from_node_id: int
-    from_socket: str
-    to_node_id: int
-    to_socket: str
-
-
-class DeleteSocketEdgesRequest(BaseModel):
-    node_id: int
-    socket: str
-    side: Literal["input", "output"]
 
 
 class GraphProgress(BaseModel):
@@ -189,7 +157,6 @@ class LeaderboardFavorite(BaseModel):
 class GraphLeaderboardRow(BaseModel):
     entity_key: str
     label: str
-    node_id: int | None
     rating: float
     wins: int
     losses: int
@@ -200,7 +167,6 @@ class GraphLeaderboardRow(BaseModel):
 
 class GraphLeaderboardGroup(BaseModel):
     title: str
-    judge_prompt_node_id: int | None
     view_mode: LeaderboardView
     rows: list[GraphLeaderboardRow]
 
@@ -208,10 +174,12 @@ class GraphLeaderboardGroup(BaseModel):
 class GraphInvocationDto(BaseModel):
     id: int
     graph_run_id: int
-    node_id: int
-    model_node_id: int | None
-    node_title: str
-    model_title: str | None
+    kind: str
+    stage_id: str
+    candidate_id: str | None
+    evaluator_id: str | None
+    lineage_key: str
+    model_id: str
     item_key: str
     stage_index: int
     status: StatusValue
@@ -219,6 +187,7 @@ class GraphInvocationDto(BaseModel):
     output_raw: str | None
     output_json: str | None
     error: str | None
+    error_category: str | None
     prompt_tokens: int | None
     completion_tokens: int | None
     duration_seconds: float | None
@@ -229,11 +198,34 @@ class GraphInvocationDto(BaseModel):
     completed_at: datetime | None
 
 
+class GraphPairDto(BaseModel):
+    id: int
+    graph_run_id: int
+    evaluator_id: str
+    target_stage_id: str
+    item_key: str
+    pair_key: str
+    a_lineage_key: str
+    b_lineage_key: str
+    direction: str
+    status: StatusValue
+    output_a: str | None
+    output_b: str | None
+    winner: str | None
+    reasoning: str
+    human_reviewer: str | None
+
+
+class HumanJudgementSubmit(BaseModel):
+    winner: Literal["A", "B", "TIE"]
+    reasoning: str = ""
+    human_reviewer: str = ""
+
+
 class GraphRunAnalysisDto(BaseModel):
     id: int
     graph_run_id: int
-    top_model_node_id: int
-    judge_prompt_node_id: int | None
+    evaluator_id: str
     leaderboard_view: str
     top_entity_key: str
     top_entity_label: str
@@ -247,17 +239,16 @@ class GraphRunAnalysisDto(BaseModel):
 class GraphRunDetail(BaseModel):
     run: GraphRunSummary
     graph: GraphSummary
-    nodes: list[GraphNodeDto]
-    edges: list[GraphEdgeDto]
+    nodes: list[SemanticNodeDto]
+    edges: list[SemanticEdgeDto]
     progress: GraphProgress
-    node_progress: dict[int, GraphProgress]
     diagnostics: list[GraphDiagnostic]
     leaderboards: list[GraphLeaderboardGroup]
     invocations: list[GraphInvocationDto]
+    human_evals: list[GraphPairDto]
     analyses: list[GraphRunAnalysisDto]
 
 
 class StartJudgeSummaryRequest(BaseModel):
-    judge_prompt_node_id: int | None = None
     leaderboard_view: LeaderboardView = "aggregate"
     top_entity_key: str = ""

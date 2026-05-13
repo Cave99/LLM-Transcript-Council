@@ -1,4 +1,4 @@
-import type { GraphDetail, GraphRunDetail, GraphRunSummary, LeaderboardView, NodeKind, ProjectDetail, ProjectSummary } from "./types";
+import type { GraphDetail, GraphPairDto, GraphRunDetail, GraphRunSummary, LeaderboardView, ProjectDetail, ProjectSummary, ValidationResult } from "./types";
 
 type RequestOptions = {
   method?: string;
@@ -30,28 +30,23 @@ export const client = {
   project: (id: number) => api<ProjectDetail>(`/projects/${id}`),
   renameProject: (id: number, name: string) => api<ProjectSummary>(`/projects/${id}`, { method: "PATCH", body: { name } }),
   deleteProject: (id: number) => api<{ ok: true }>(`/projects/${id}`, { method: "DELETE" }),
-  createGraph: (project_id: number, name: string) => api(`/graphs`, { method: "POST", body: { project_id, name } }),
+  createGraph: (project_id: number, name: string, spec?: Record<string, unknown>) => api(`/graphs`, { method: "POST", body: { project_id, name, spec } }),
   graph: (id: number) => api<GraphDetail>(`/graphs/${id}`),
-  renameGraph: (id: number, name: string) => api(`/graphs/${id}`, { method: "PATCH", body: { name } }),
+  updateGraph: (id: number, body: { name?: string; spec?: Record<string, unknown>; layout?: Record<string, unknown> }) => api<GraphDetail>(`/graphs/${id}`, { method: "PATCH", body }),
+  renameGraph: (id: number, name: string) => api<GraphDetail>(`/graphs/${id}`, { method: "PATCH", body: { name } }),
+  validateSpec: (spec: Record<string, unknown>) => api<ValidationResult>("/graphs/validate-spec", { method: "POST", body: spec }),
+  replaceSpec: (id: number, spec: Record<string, unknown>) => api<GraphDetail>(`/graphs/${id}/spec`, { method: "PUT", body: spec }),
   forkGraph: (id: number) => api(`/graphs/${id}/fork`, { method: "POST" }),
   deleteGraph: (id: number) => api<{ ok: true }>(`/graphs/${id}`, { method: "DELETE" }),
   launchGraph: (id: number, run_mode: "test" | "full", max_concurrency: number) =>
     api<GraphRunSummary>(`/graphs/${id}/launch`, { method: "POST", body: { run_mode, max_concurrency } }),
-  createNode: (graphId: number, kind: NodeKind, x?: number, y?: number, title?: string) =>
-    api(`/graphs/${graphId}/nodes`, { method: "POST", body: { kind, x, y, title } }),
-  updateNode: (nodeId: number, title: string, body: string, config: Record<string, unknown>) =>
-    api(`/nodes/${nodeId}`, { method: "PATCH", body: { title, body, config } }),
-  updateNodePosition: (nodeId: number, x: number, y: number, width?: number, height?: number) =>
-    api(`/nodes/${nodeId}/position`, { method: "PATCH", body: { x, y, width, height } }),
-  deleteNode: (nodeId: number) => api<{ ok: true }>(`/nodes/${nodeId}`, { method: "DELETE" }),
-  createEdge: (graphId: number, from_node_id: number, from_socket: string, to_node_id: number, to_socket: string) =>
-    api(`/graphs/${graphId}/edges`, { method: "POST", body: { from_node_id, from_socket, to_node_id, to_socket } }),
-  deleteEdge: (edgeId: number) => api<{ ok: true }>(`/edges/${edgeId}`, { method: "DELETE" }),
   graphRun: (id: number, leaderboardView: LeaderboardView = "aggregate") => api<GraphRunDetail>(`/graph-runs/${id}?leaderboard_view=${leaderboardView}`),
   stopRun: (id: number) => api<GraphRunSummary>(`/graph-runs/${id}/stop`, { method: "POST" }),
   continueRun: (id: number) => api<GraphRunSummary>(`/graph-runs/${id}/continue`, { method: "POST" }),
   retryFailures: (id: number) => api<GraphRunSummary>(`/graph-runs/${id}/retry-failures`, { method: "POST" }),
+  humanEvals: (id: number) => api<GraphPairDto[]>(`/graph-runs/${id}/human-evals`),
+  submitHumanEval: (runId: number, pairId: number, winner: "A" | "B" | "TIE", reasoning: string, human_reviewer: string) =>
+    api<GraphPairDto>(`/graph-runs/${runId}/human-evals/${pairId}`, { method: "POST", body: { winner, reasoning, human_reviewer } }),
   judgeSummary: (id: number, leaderboard_view: LeaderboardView, judge_prompt_node_id?: number | null, top_entity_key = "") =>
-    api<{ ok: true }>(`/graph-runs/${id}/judge-summary`, { method: "POST", body: { leaderboard_view, judge_prompt_node_id, top_entity_key } })
+    api<{ ok: true }>(`/graph-runs/${id}/judge-summary`, { method: "POST", body: { leaderboard_view, top_entity_key } })
 };
-

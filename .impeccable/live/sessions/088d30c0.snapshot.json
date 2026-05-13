@@ -1,0 +1,27 @@
+{
+  "id": "088d30c0",
+  "phase": "variants_ready",
+  "pageUrl": "/graphs/7",
+  "sourceFile": "frontend/src/features/graphs/graph-detail-page.tsx",
+  "expectedVariants": 3,
+  "arrivedVariants": 3,
+  "visibleVariant": 1,
+  "paramValues": {
+    "density": 1
+  },
+  "pendingEventSeq": null,
+  "pendingEvent": null,
+  "deliveryLease": null,
+  "checkpointRevision": 3,
+  "activeOwner": "cae640b2",
+  "sourceMarkers": {},
+  "fallbackMode": null,
+  "annotationArtifacts": [],
+  "diagnostics": [
+    {
+      "error": "stale_checkpoint_ignored",
+      "revision": 1
+    }
+  ],
+  "updatedAt": "2026-05-13T03:23:39.684Z"
+}

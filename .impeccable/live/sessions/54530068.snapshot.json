@@ -1,0 +1,22 @@
+{
+  "id": "54530068",
+  "phase": "variants_ready",
+  "pageUrl": "/graphs/7",
+  "sourceFile": "frontend/src/features/graphs/graph-detail-page.tsx",
+  "expectedVariants": 3,
+  "arrivedVariants": 3,
+  "visibleVariant": 1,
+  "paramValues": {
+    "density": 1
+  },
+  "pendingEventSeq": null,
+  "pendingEvent": null,
+  "deliveryLease": null,
+  "checkpointRevision": 2,
+  "activeOwner": "74b7b23d",
+  "sourceMarkers": {},
+  "fallbackMode": null,
+  "annotationArtifacts": [],
+  "diagnostics": [],
+  "updatedAt": "2026-05-13T03:31:44.046Z"
+}

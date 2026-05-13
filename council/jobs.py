@@ -1,4 +1,4 @@
-"""Tiny background-thread launcher for local run and analysis jobs."""
+"""Tiny background-thread launcher for local graph jobs."""
 
 from __future__ import annotations
 
@@ -9,54 +9,14 @@ from collections.abc import Callable
 
 from sqlmodel import Session
 
-from council.analysis import generate_graph_run_judge_summary, generate_judge_pattern_analysis
+from council.analysis import generate_graph_run_judge_summary
 from council.graph_runtime import execute_graph_native_run
-from council.models import ExperimentGraph, GraphRun, GraphStatus, Run, Status
-from council.runner import execute_run
+from council.models import ExperimentGraph, GraphRun, GraphStatus, Status
 
 SessionFactory = Callable[[], Session]
 
-RUN_THREADS: dict[int, threading.Thread] = {}
 GRAPH_RUN_THREADS: dict[int, threading.Thread] = {}
-ANALYSIS_THREADS: dict[int, threading.Thread] = {}
 GRAPH_ANALYSIS_THREADS: dict[tuple[int, int | None, str, str], threading.Thread] = {}
-
-
-def start_run_thread(run_id: int, session_factory: SessionFactory) -> None:
-    """Start a background run worker if one is not already active."""
-
-    if _thread_is_running(RUN_THREADS, run_id):
-        return
-
-    def target() -> None:
-        try:
-            asyncio.run(execute_run(run_id, session_factory))
-        except Exception as exc:
-            with session_factory() as session:
-                run = session.get(Run, run_id)
-                if run:
-                    run.status = Status.failed
-                    run.error = str(exc)
-                    session.add(run)
-                    graph = session.get(ExperimentGraph, run.graph_id)
-                    if graph:
-                        graph.status = GraphStatus.failed
-                        session.add(graph)
-                    session.commit()
-
-    _start_thread(RUN_THREADS, run_id, target)
-
-
-def start_analysis_thread(run_id: int, session_factory: SessionFactory) -> None:
-    """Start a judge-pattern analysis worker if one is not already active."""
-
-    if _thread_is_running(ANALYSIS_THREADS, run_id):
-        return
-
-    def target() -> None:
-        asyncio.run(generate_judge_pattern_analysis(run_id, session_factory))
-
-    _start_thread(ANALYSIS_THREADS, run_id, target)
 
 
 def start_graph_analysis_thread(
@@ -115,12 +75,6 @@ def start_graph_run_thread(graph_run_id: int, session_factory: SessionFactory) -
             print(f"[graph run {graph_run_id}] Background worker thread stopped.", flush=True)
 
     _start_thread(GRAPH_RUN_THREADS, graph_run_id, target)
-
-
-def run_thread_is_active(run_id: int) -> bool:
-    """Report whether a run worker is currently active."""
-
-    return _thread_is_running(RUN_THREADS, run_id)
 
 
 def _thread_is_running(threads: dict[int, threading.Thread], key: int) -> bool:
