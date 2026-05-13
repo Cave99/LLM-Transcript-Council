@@ -16,20 +16,19 @@ from council.models import ExperimentGraph, GraphRun, GraphStatus, Status
 SessionFactory = Callable[[], Session]
 
 GRAPH_RUN_THREADS: dict[int, threading.Thread] = {}
-GRAPH_ANALYSIS_THREADS: dict[tuple[int, int | None, str, str], threading.Thread] = {}
+GRAPH_ANALYSIS_THREADS: dict[tuple[int, str, str], threading.Thread] = {}
 
 
 def start_graph_analysis_thread(
     graph_run_id: int,
     session_factory: SessionFactory,
     *,
-    judge_prompt_node_id: int | None = None,
     leaderboard_view: str = "aggregate",
     top_entity_key: str = "",
 ) -> None:
     """Start a graph-run judge summary worker if one is not already active."""
 
-    key = (graph_run_id, judge_prompt_node_id, leaderboard_view, top_entity_key)
+    key = (graph_run_id, leaderboard_view, top_entity_key)
     if _thread_is_running(GRAPH_ANALYSIS_THREADS, key):
         return
 
@@ -38,7 +37,6 @@ def start_graph_analysis_thread(
             generate_graph_run_judge_summary(
                 graph_run_id,
                 session_factory,
-                judge_prompt_node_id=judge_prompt_node_id,
                 leaderboard_view=leaderboard_view,
                 top_entity_key=top_entity_key,
             )
@@ -77,7 +75,7 @@ def start_graph_run_thread(graph_run_id: int, session_factory: SessionFactory) -
     _start_thread(GRAPH_RUN_THREADS, graph_run_id, target)
 
 
-def _thread_is_running(threads: dict[int, threading.Thread], key: int) -> bool:
+def _thread_is_running(threads, key) -> bool:
     """Keep duplicate worker checks consistent across job types."""
 
     return key in threads and threads[key].is_alive()

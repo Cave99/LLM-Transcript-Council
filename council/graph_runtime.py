@@ -285,7 +285,6 @@ def graph_run_leaderboards(session, graph_run_id: int, _nodes=None, *, view_mode
         {
             "entity_key": key,
             "label": candidate_labels.get(key, key),
-            "node_id": None,
             "rating": rating,
             "wins": records.get(key, {}).get("wins", 0),
             "losses": records.get(key, {}).get("losses", 0),
@@ -295,7 +294,7 @@ def graph_run_leaderboards(session, graph_run_id: int, _nodes=None, *, view_mode
         }
         for key, rating in sorted(ratings.items(), key=lambda item: item[1], reverse=True)
     ]
-    return [{"title": "ELO Leaderboard", "judge_prompt_node_id": None, "view_mode": view_mode, "rows": rows}]
+    return [{"title": "ELO Leaderboard", "view_mode": view_mode, "rows": rows}]
 
 
 def graph_run_leaderboard(session, graph_run_id: int, nodes=None) -> list[dict[str, Any]]:

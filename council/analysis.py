@@ -24,7 +24,6 @@ async def generate_graph_run_judge_summary(
     session_factory,
     client: OpenRouterClient | None = None,
     *,
-    judge_prompt_node_id: int | None = None,
     leaderboard_view: str = "aggregate",
     top_entity_key: str = "",
 ) -> None:

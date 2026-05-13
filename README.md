@@ -49,9 +49,9 @@ Instead of tuning a judge rubric for every project, the default judge prompt com
 - Transcript markdown lives in `transcripts/`.
 - `backend/` is the FastAPI API layer for the graph-native workflow.
 - `frontend/` is the React, TypeScript, Tailwind, shadcn-style, and React Flow UI.
-- `app.py` is the legacy local FastHTML shell kept temporarily during the migration; do not add new UI there.
 - `council/models.py` defines the SQLite entities and status enums.
-- `council/graphs.py` owns graph drafts, nodes, edges, planning, and socket discovery.
+- `council/graph_spec.py` defines the canonical graph spec, validation, hashing, and generated semantic layout.
+- `council/graphs.py` owns graph drafts, layout, and planning.
 - `council/graph_runtime.py` executes graph-native runs and computes graph-native leaderboards.
 - `council/jobs.py` starts local background threads for graph runs and judge-summary analysis.
 - `council/analysis.py` samples graph judge reasoning traces and persists judge summaries.
@@ -59,7 +59,6 @@ Instead of tuning a judge rubric for every project, the default judge prompt com
 - `council/files.py` snapshots markdown files.
 - `council/json_tools.py` repairs and parses JSON-ish model output.
 - `council/elo.py` contains pure ELO math used by graph-native leaderboards.
-- `council/runner.py`, `council/generation.py`, `council/judging.py`, `council/leaderboard.py`, `council/run_rows.py`, `council/run_state.py`, and `council/reports.py` are legacy traditional-run modules kept until the migration cleanup phase.
 
 ## Prompt Placeholders
 
@@ -84,8 +83,8 @@ Keep prompt files markdown-only and simple. The renderer does straight string re
 ## Data Flow
 
 1. A project owns one or more local experiment graphs.
-2. A graph stores dataset, constant, prompt, model, and judge nodes plus socket edges.
-3. `council/graphs.py` computes the launch plan and warnings from persisted graph rows.
+2. A graph stores dataset config, constants, prompt stages, model candidates, and evaluators in one canonical spec.
+3. `council/graphs.py` computes the launch plan and warnings from the persisted spec.
 4. The React UI launches a graph run through `POST /api/graphs/{id}/launch`.
 5. `council/jobs.py` starts a local background thread.
 6. `council/graph_runtime.py` executes prompt stages over each dataset item and model branch.
@@ -98,7 +97,6 @@ The graph-native workflow is now exposed through JSON APIs under `/api`:
 
 - `/api/projects` for project CRUD and recent graph runs
 - `/api/graphs` for graph drafts, planning, launch, fork, and delete
-- `/api/nodes` and `/api/edges` for React Flow graph editing
 - `/api/graph-runs` for run reports, stop, continue, retry failures, and progress events
 - `/api/graph-runs/{id}/judge-summary` for background judge-summary analysis
 
@@ -106,19 +104,18 @@ The React app is intentionally styled to match the original calm local workbench
 
 ## Node Graphs
 
-The newer setup path is project-scoped graphs. A graph is a local visual draft made of dataset, prompt, constant, model, and judge nodes. The graph page shows the execution plan before launch, including transcript counts, generation calls, sampled pairwise matches, and judge calls.
+The setup path is project-scoped graphs. A graph is a local visual draft generated from a canonical spec with dataset config, constants, prompt stages, model candidates, and evaluators. The graph page shows the execution plan before launch, including transcript counts, generation calls, sampled pairwise matches, and judge calls.
 
 Current graph launch support covers:
 
 - markdown-folder transcript datasets
 - CSV datasets for chained graph runs
 - in-app generator and judge prompt templates
-- `{{ socket }}` discovery after prompt save
 - reusable model nodes for generator or judge roles
 - pairwise sample percentage and run-level A/B swap validation
 - graph-native chained prompt runs that pass `{{ previous_output }}` between prompt stages
 - raw-text or repaired-JSON upstream output mode on prompt nodes
-- draggable node positioning persisted on the graph
+- draggable semantic node positioning persisted on the graph
 - completed graph configs that can be forked into editable drafts
 - React Flow graph editing through the Vite frontend
 

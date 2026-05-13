@@ -1,4 +1,4 @@
-"""Spec-backed graph CRUD, planning, and legacy import helpers."""
+"""Spec-backed graph CRUD and planning helpers."""
 
 from __future__ import annotations
 
@@ -7,10 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
 from sqlmodel import Session, select
 
-from council.graph_spec import GraphSpec, dump_spec, generated_layout, legacy_graph_to_spec, minimal_spec, parse_spec, spec_hash, validate_spec_payload
+from council.graph_spec import GraphSpec, dump_spec, generated_layout, minimal_spec, parse_spec, spec_hash, validate_spec_payload
 from council.models import ExperimentGraph, GraphInvocation, GraphJudgement, GraphPair, GraphRun, GraphRunAnalysis, GraphStatus, Project, utc_now
 
 
@@ -50,17 +49,15 @@ def create_graph(session: Session, project_id: int, name: str, spec_payload: dic
 
 
 def ensure_graph_spec(session: Session, graph: ExperimentGraph) -> ExperimentGraph:
-    """Populate spec_json for old low-level graph drafts exactly once."""
+    """Ensure a graph always has a canonical spec payload."""
 
     if not graph:
         raise ValueError("Graph does not exist")
     if graph.spec_json and graph.spec_json != "{}":
         return graph
-    raw_nodes = _legacy_rows(session, "graphnode", graph.id)
-    raw_edges = _legacy_rows(session, "graphedge", graph.id)
-    spec, layout = legacy_graph_to_spec(raw_nodes, raw_edges) if raw_nodes else (minimal_spec(), _default_layout(minimal_spec()))
+    spec = minimal_spec()
     graph.spec_json = dump_spec(spec)
-    graph.layout_json = json.dumps(layout, sort_keys=True)
+    graph.layout_json = json.dumps(_default_layout(spec), sort_keys=True)
     graph.spec_hash = spec_hash(spec)
     graph.updated_at = utc_now()
     session.add(graph)
@@ -234,15 +231,6 @@ def plan_graph(session: Session, graph_id: int, *, sample_size: int | None = Non
         human_review_count=human_review_count,
         warnings=tuple(warnings),
     )
-
-
-def _legacy_rows(session: Session, table_name: str, graph_id: int) -> list[dict[str, Any]]:
-    try:
-        connection = session.connection()
-        result = connection.execute(text(f"SELECT * FROM {table_name} WHERE graph_id = :graph_id"), {"graph_id": graph_id})
-        return [dict(row._mapping) for row in result.all()]
-    except Exception:
-        return []
 
 
 def _default_layout(spec: GraphSpec) -> dict[str, dict[str, int]]:

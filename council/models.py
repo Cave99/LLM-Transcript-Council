@@ -74,8 +74,6 @@ class GraphRun(SQLModel, table=True):
 class GraphInvocation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     graph_run_id: int = Field(foreign_key="graphrun.id")
-    node_id: int = 0
-    model_node_id: Optional[int] = None
     kind: str = "generation"
     stage_id: str = ""
     candidate_id: Optional[str] = None
@@ -131,8 +129,6 @@ class GraphJudgement(SQLModel, table=True):
 class GraphRunAnalysis(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     graph_run_id: int = Field(foreign_key="graphrun.id")
-    top_model_node_id: Optional[int] = None
-    judge_prompt_node_id: Optional[int] = None
     evaluator_id: str = ""
     leaderboard_view: str = "aggregate"
     top_entity_key: str = ""

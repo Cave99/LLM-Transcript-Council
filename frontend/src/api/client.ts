@@ -47,6 +47,6 @@ export const client = {
   humanEvals: (id: number) => api<GraphPairDto[]>(`/graph-runs/${id}/human-evals`),
   submitHumanEval: (runId: number, pairId: number, winner: "A" | "B" | "TIE", reasoning: string, human_reviewer: string) =>
     api<GraphPairDto>(`/graph-runs/${runId}/human-evals/${pairId}`, { method: "POST", body: { winner, reasoning, human_reviewer } }),
-  judgeSummary: (id: number, leaderboard_view: LeaderboardView, judge_prompt_node_id?: number | null, top_entity_key = "") =>
+  judgeSummary: (id: number, leaderboard_view: LeaderboardView, top_entity_key = "") =>
     api<{ ok: true }>(`/graph-runs/${id}/judge-summary`, { method: "POST", body: { leaderboard_view, top_entity_key } })
 };

@@ -58,7 +58,6 @@ def init_db() -> None:
             connection.execute(text("ALTER TABLE graphinvocation ADD COLUMN output_tokens_per_second FLOAT"))
         graph_analysis_columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(graphrunanalysis)").all()}
         for column_name, column_type in {
-            "judge_prompt_node_id": "INTEGER",
             "evaluator_id": "VARCHAR DEFAULT ''",
             "leaderboard_view": "VARCHAR DEFAULT 'aggregate'",
             "top_entity_key": "VARCHAR DEFAULT ''",
